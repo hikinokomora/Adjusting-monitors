@@ -6,6 +6,7 @@ description = "Precise alignment of monitor positions on Windows with on-screen 
 license = "MIT"
 
 [dependencies]
+eframe = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
