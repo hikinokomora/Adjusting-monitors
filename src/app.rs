@@ -88,6 +88,10 @@ pub struct App {
     view_scale: f32,
     fit_view: bool,
     last_canvas: egui::Rect,
+    /// Floating panels over the canvas last frame; clicks there don't reach the canvas.
+    floating: Vec<egui::Rect>,
+    anchor_bar: Vec2,
+    zoom_bar: Vec2,
     drag: Option<Drag>,
 }
 
@@ -119,6 +123,9 @@ impl App {
             view_scale: 0.1,
             fit_view: true,
             last_canvas: egui::Rect::NOTHING,
+            floating: Vec::new(),
+            anchor_bar: Vec2::new(400.0, 46.0),
+            zoom_bar: Vec2::new(170.0, 46.0),
             drag: None,
         };
         app.reload();
@@ -375,13 +382,13 @@ impl App {
 
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let (r, _) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::hover());
-            ui.painter().rect_filled(r, CornerRadius::same(10), theme::ACCENT_DIM);
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, icon::RULER, FontId::proportional(19.0), theme::ACCENT);
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
+            ui.painter().rect_filled(r, CornerRadius::same(theme::RADIUS), theme::ACCENT);
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, icon::RULER, FontId::proportional(16.0), Color32::WHITE);
             ui.add_space(4.0);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(theme::strong("Выравнивание мониторов").size(16.0));
+                ui.label(theme::strong("Выравнивание мониторов").size(15.0));
                 let (x0, y0, x1, y1) = self.bounds(&self.applied_mons());
                 ui.label(
                     RichText::new(format!("{} {} · рабочий стол {}×{}", self.displays.len(), monitors_word(self.displays.len()), x1 - x0, y1 - y0))
@@ -433,7 +440,9 @@ impl App {
                     StatusKind::Warn => theme::AMBER,
                     StatusKind::Error => theme::RED,
                 };
-                theme::pill(ui, color, &text);
+                if kind != StatusKind::Info {
+                    theme::status(ui, color, &text);
+                }
             });
         });
     }
@@ -442,13 +451,14 @@ impl App {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         theme::caption(ui, "Мониторы");
+        ui.spacing_mut().item_spacing.y = 8.0;
         for i in 0..self.displays.len() {
             self.monitor_row(ui, i);
         }
-        ui.add_space(6.0);
+        ui.add_space(8.0);
 
         let Some(i) = self.selected.filter(|&i| i < self.displays.len()) else {
-            theme::card(ui, |ui| ui.label("Выберите монитор на схеме"));
+            theme::card(ui, "Монитор", |ui| ui.label("Выберите монитор на схеме"));
             return;
         };
         self.position_card(ui, i);
@@ -460,6 +470,8 @@ impl App {
         let d = &self.displays[i];
         let sel = self.selected == Some(i);
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 52.0), Sense::click());
+        let p = ui.painter();
+        let r = CornerRadius::same(theme::RADIUS);
         let fill = if sel {
             theme::ACCENT_DIM
         } else if resp.hovered() {
@@ -467,21 +479,21 @@ impl App {
         } else {
             theme::CARD
         };
-        let p = ui.painter();
-        p.rect(rect, CornerRadius::same(10), fill, Stroke::new(1.0, if sel { theme::ACCENT } else { theme::STROKE }), StrokeKind::Inside);
-        let badge = egui::Rect::from_center_size(Pos2::new(rect.left() + 28.0, rect.center().y), Vec2::splat(32.0));
-        p.rect_filled(badge, CornerRadius::same(8), if sel { theme::ACCENT } else { theme::CARD_HI });
-        p.text(badge.center(), Align2::CENTER_CENTER, d.number.to_string(), FontId::new(16.0, egui::FontFamily::Name("strong".into())), Color32::WHITE);
-        p.text(Pos2::new(rect.left() + 54.0, rect.top() + 16.0), Align2::LEFT_CENTER, &d.name, FontId::new(14.0, egui::FontFamily::Name("strong".into())), theme::TEXT);
+        p.rect(rect, r, fill, Stroke::new(1.0, if sel { theme::ACCENT } else { theme::STROKE }), StrokeKind::Inside);
+        let badge = egui::Rect::from_center_size(Pos2::new(rect.left() + 26.0, rect.center().y), Vec2::splat(28.0));
+        p.rect_filled(badge, CornerRadius::same(theme::RADIUS - 2), if sel { theme::ACCENT } else { theme::CARD_HI });
+        let strong = theme::strong_family();
+        p.text(badge.center(), Align2::CENTER_CENTER, d.number.to_string(), FontId::new(14.0, strong.clone()), Color32::WHITE);
+        p.text(Pos2::new(rect.left() + 50.0, rect.top() + 17.0), Align2::LEFT_CENTER, &d.name, FontId::new(14.0, strong), theme::TEXT);
         p.text(
-            Pos2::new(rect.left() + 54.0, rect.top() + 35.0),
+            Pos2::new(rect.left() + 50.0, rect.top() + 35.0),
             Align2::LEFT_CENTER,
-            format!("{}×{} · {} Гц", d.width, d.height, d.refresh),
+            format!("{}×{} · {} Гц · {:.0}%", d.width, d.height, d.refresh, d.dpi_scale * 100.0),
             FontId::proportional(12.0),
             theme::MUTED,
         );
         if d.primary {
-            p.text(Pos2::new(rect.right() - 12.0, rect.center().y), Align2::RIGHT_CENTER, "основной", FontId::proportional(12.0), theme::ACCENT);
+            p.text(Pos2::new(rect.right() - 12.0, rect.center().y), Align2::RIGHT_CENTER, "основной", FontId::proportional(12.0), theme::MUTED);
         }
         if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             self.selected = Some(i);
@@ -489,8 +501,8 @@ impl App {
     }
 
     fn position_card(&mut self, ui: &mut egui::Ui, i: usize) {
-        theme::card(ui, |ui| {
-            theme::caption(ui, &format!("Положение монитора {}", self.displays[i].number));
+        let title = format!("Положение монитора {}", self.displays[i].number);
+        theme::card(ui, &title, |ui| {
             ui.horizontal(|ui| {
                 let (mut x, mut y) = self.pos[i];
                 let mut changed = false;
@@ -539,12 +551,12 @@ impl App {
 
     fn screen_card(&mut self, ui: &mut egui::Ui, i: usize) {
         let d = self.displays[i].clone();
-        theme::card(ui, |ui| {
-            theme::caption(ui, "Экран");
+        theme::card(ui, "Экран", |ui| {
             let (mw, mh) = self.mm(i);
             let diag = (mw * mw + mh * mh).sqrt() / 25.4;
             let ppi = d.width as f32 / (mw / 25.4);
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 28.0;
                 theme::stat(ui, "Диагональ", &format!("{diag:.1}″"));
                 theme::stat(ui, "Плотность", &format!("{ppi:.0} PPI"));
                 theme::stat(ui, "Масштаб", &format!("{:.0}%", d.dpi_scale * 100.0));
@@ -587,8 +599,7 @@ impl App {
         let mons = self.edited_mons();
         let edges: Vec<Edge> = find_edges(&mons).into_iter().filter(|e| e.a == i || e.b == i).collect();
         if edges.is_empty() {
-            theme::card(ui, |ui| {
-                theme::caption(ui, "Стыки");
+            theme::card(ui, "Стыки", |ui| {
                 ui.label(RichText::new("Монитор не касается других. При применении он будет придвинут к ближайшему.").color(theme::AMBER));
             });
             return;
@@ -604,8 +615,8 @@ impl App {
             };
             let other = self.displays[j].clone();
             let anchor = self.anchor;
-            theme::card(ui, |ui| {
-                theme::caption(ui, &format!("Стык с монитором {} · {side}", other.number));
+            let title = format!("Стык с монитором {} · {side}", other.number);
+            theme::card(ui, &title, |ui| {
 
                 let t0 = anchor_t(&e, anchor, None);
                 // Offset of this monitor's side relative to the neighbour's, positive = lower / further right.
@@ -617,7 +628,8 @@ impl App {
                     e.start(&mons[e.a]) - e.start(&mons[e.b])
                 };
                 ui.horizontal(|ui| {
-                    ui.label(theme::strong(format!("{:.1} мм", mine.abs())).size(24.0));
+                    ui.label(theme::strong(format!("{:.1} мм", mine.abs())).size(22.0));
+                    ui.add_space(4.0);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.label(RichText::new(format!("{start_word} {} края соседа", if mine >= 0.0 { low } else { high })).size(12.0).color(theme::MUTED));
@@ -677,17 +689,75 @@ impl App {
 
     // ---------------------------------------------------------------- canvas
 
-    fn canvas_toolbar(&mut self, ui: &mut egui::Ui) {
-        // One row when there is room, otherwise the anchor picker goes to its own row.
-        if ui.available_width() >= 980.0 {
-            ui.horizontal(|ui| {
-                self.toggles(ui);
-                ui.add_space(10.0);
-                self.anchor_picker(ui);
-            });
+    /// Controls floating over the canvas: switches, ruler zero, zoom and a hint.
+    fn canvas_overlays(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
+        let inner = area.shrink(12.0);
+        let mut floating = Vec::new();
+
+        let mut tl = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Min)));
+        theme::floating(&mut tl, |ui| self.toggles(ui));
+        let first = tl.min_rect();
+        floating.push(first);
+
+        // egui lays out in one pass, so right-aligned panels use their size from the previous frame.
+        let at_right = |size: Vec2, top: f32| {
+            egui::Rect::from_min_max(Pos2::new((inner.right() - size.x).max(inner.left()), top), inner.max)
+        };
+
+        // Ruler zero goes to the right corner when there is room, otherwise under the switches.
+        let wide = inner.width() >= first.width() + self.anchor_bar.x + 16.0;
+        let rect = if wide {
+            at_right(self.anchor_bar, inner.top())
         } else {
-            ui.horizontal(|ui| self.toggles(ui));
-            ui.horizontal(|ui| self.anchor_picker(ui));
+            egui::Rect::from_min_max(Pos2::new(inner.left(), first.bottom() + 8.0), inner.max)
+        };
+        let mut tr = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Min)));
+        theme::floating(&mut tr, |ui| self.anchor_picker(ui));
+        floating.push(tr.min_rect());
+        self.remember_size(&mut 0, tr.min_rect().size(), ui.ctx());
+
+        let zoom_rect = egui::Rect::from_min_max(inner.max - self.zoom_bar, inner.max);
+        let mut br = ui.new_child(egui::UiBuilder::new().max_rect(zoom_rect).layout(Layout::left_to_right(Align::Min)));
+        theme::floating(&mut br, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let c = area.center().to_vec2();
+            let zoom = |f: f32, this: &mut Self| {
+                this.view_offset = c + (this.view_offset - c) * f;
+                this.view_scale *= f;
+            };
+            if theme::icon_button(ui, icon::ZOOM_OUT).on_hover_text("Отдалить").clicked() {
+                zoom(1.0 / 1.25, self);
+            }
+            ui.add_sized([46.0, 30.0], egui::Label::new(RichText::new(format!("{:.0}%", self.view_scale * 100.0)).size(12.0).color(theme::MUTED)));
+            if theme::icon_button(ui, icon::ZOOM_IN).on_hover_text("Приблизить").clicked() {
+                zoom(1.25, self);
+            }
+            if theme::icon_button(ui, icon::FIT).on_hover_text("Показать всю раскладку").clicked() {
+                self.fit_view = true;
+            }
+        });
+        floating.push(br.min_rect());
+        self.remember_size(&mut 1, br.min_rect().size(), ui.ctx());
+
+        // The hint only where it fits next to the zoom panel.
+        let hint_rect = egui::Rect::from_min_max(inner.min, Pos2::new(inner.right() - self.zoom_bar.x - 16.0, inner.bottom()));
+        let mut bl = ui.new_child(egui::UiBuilder::new().max_rect(hint_rect).layout(Layout::bottom_up(Align::Min)));
+        if hint_rect.width() >= 600.0 {
+            bl.label(
+            RichText::new("Тяните мониторы мышью · Alt — без прилипания · колесо — масштаб · правая кнопка — сдвиг вида")
+                .size(12.0)
+                .color(theme::MUTED.gamma_multiply(0.8)),
+            );
+        }
+
+        self.floating = floating;
+    }
+
+    fn remember_size(&mut self, which: &mut u8, size: Vec2, ctx: &egui::Context) {
+        let slot = if *which == 0 { &mut self.anchor_bar } else { &mut self.zoom_bar };
+        if (*slot - size).length() > 0.5 {
+            *slot = size;
+            ctx.request_repaint();
         }
     }
 
@@ -716,9 +786,6 @@ impl App {
         ) {
             self.save_config();
             self.push_overlay();
-        }
-        if theme::ghost_button(ui, icon::FIT).on_hover_text("Показать всю раскладку").clicked() {
-            self.fit_view = true;
         }
     }
 
@@ -790,6 +857,8 @@ impl App {
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let area = resp.rect;
+        let hover = ui.input(|i| i.pointer.hover_pos());
+        let pointer_on_floating = hover.is_some_and(|p| self.floating.iter().any(|r| r.contains(p)));
         if self.fit_view || (area.size() != self.last_canvas.size() && self.drag.is_none()) {
             self.fit(area);
             self.fit_view = false;
@@ -797,7 +866,7 @@ impl App {
         self.last_canvas = area;
 
         // Zoom around the cursor, pan with the right or middle button.
-        if let Some(hp) = resp.hover_pos() {
+        if let Some(hp) = resp.hover_pos().filter(|_| !pointer_on_floating) {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll != 0.0 {
                 let f = (scroll * 0.004).exp();
@@ -809,7 +878,7 @@ impl App {
             self.view_offset += resp.drag_delta();
         }
 
-        if resp.drag_started_by(PointerButton::Primary) {
+        if resp.drag_started_by(PointerButton::Primary) && !pointer_on_floating {
             if let Some(p) = resp.interact_pointer_pos() {
                 if let Some(i) = self.hit(p) {
                     self.selected = Some(i);
@@ -836,7 +905,7 @@ impl App {
                 self.attach(i);
             }
         }
-        if resp.clicked() {
+        if resp.clicked() && !pointer_on_floating {
             if let Some(p) = resp.interact_pointer_pos() {
                 if let Some(i) = self.hit(p) {
                     self.selected = Some(i);
@@ -844,13 +913,15 @@ impl App {
             }
         }
 
-        let painter = painter.with_clip_rect(area);
-        painter.rect(area, CornerRadius::same(14), theme::BG, Stroke::new(1.0, theme::STROKE), StrokeKind::Inside);
-        self.draw_grid(&painter, area);
+        let painter = painter.with_clip_rect(area.expand(1.0));
+        painter.rect_filled(area, CornerRadius::same(theme::RADIUS), theme::BG);
+        self.draw_grid(&painter.with_clip_rect(area.shrink(2.0)), area);
+        painter.rect_stroke(area, CornerRadius::same(theme::RADIUS), Stroke::new(1.0, theme::STROKE), StrokeKind::Inside);
+        let painter = painter.with_clip_rect(area.shrink(1.0));
 
         let mons = self.edited_mons();
         let applied = self.applied_mons();
-        let strong = egui::FontFamily::Name("strong".into());
+        let strong = theme::strong_family();
 
         // Where monitors are right now in Windows, if they've been moved since.
         for (i, m) in applied.iter().enumerate() {
@@ -858,7 +929,7 @@ impl App {
                 let r = self.screen_rect(&m.rect);
                 let s = Stroke::new(1.0, theme::MUTED);
                 let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
-                painter.extend(Shape::dashed_line(&pts, s, 6.0, 5.0));
+                painter.extend(Shape::dashed_line(&pts, s, 7.0, 5.0));
             }
         }
 
@@ -868,69 +939,59 @@ impl App {
             let sel = self.selected == Some(i);
             let overlaps = mons.iter().enumerate().any(|(j, o)| j != i && o.rect.intersects(&m.rect));
 
-            painter.rect_filled(r.translate(Vec2::new(0.0, 4.0)).expand(2.0), CornerRadius::same(8), Color32::from_black_alpha(90));
-            let fill = if sel { Color32::from_rgb(30, 44, 78) } else { theme::CARD_HI };
-            painter.rect_filled(r, CornerRadius::same(6), fill);
-            // A thin "bezel" at the top, like a real screen.
-            let bezel = egui::Rect::from_min_max(r.left_top(), Pos2::new(r.right(), r.top() + 3.0));
-            painter.rect_filled(bezel, CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, if sel { theme::ACCENT } else { theme::STROKE });
+            let fill = if sel { theme::ACCENT_DIM } else { theme::CARD };
+            painter.rect_filled(r, CornerRadius::same(4), fill);
             let border = if overlaps {
                 theme::RED
             } else if sel {
                 theme::ACCENT
             } else {
-                theme::STROKE
+                Color32::from_rgb(84, 84, 94)
             };
-            painter.rect_stroke(r, CornerRadius::same(6), Stroke::new(if sel { 2.0 } else { 1.0 }, border), StrokeKind::Inside);
-            if sel {
-                painter.rect_stroke(r.expand(4.0), CornerRadius::same(9), Stroke::new(3.0, theme::ACCENT.gamma_multiply(0.18)), StrokeKind::Outside);
-            }
+            painter.rect_stroke(r, CornerRadius::same(4), Stroke::new(if sel { 2.0 } else { 1.0 }, border), StrokeKind::Inside);
 
-            let big = (r.height() * 0.3).clamp(12.0, 72.0);
+            let big = (r.height() * 0.32).clamp(12.0, 84.0);
             painter.text(
                 r.center() - Vec2::new(0.0, big * 0.3),
                 Align2::CENTER_CENTER,
                 d.number.to_string(),
                 FontId::new(big, strong.clone()),
-                if sel { Color32::WHITE } else { theme::TEXT.gamma_multiply(0.85) },
+                if sel { Color32::WHITE } else { theme::MUTED },
             );
-            if r.width() > 130.0 && r.height() > 80.0 {
+            if r.width() > 140.0 && r.height() > 90.0 {
                 let (mw, mh) = self.mm(i);
                 painter.text(r.center() + Vec2::new(0.0, big * 0.42), Align2::CENTER_TOP, &d.name, FontId::new(13.0, strong.clone()), theme::TEXT);
                 painter.text(
-                    r.center() + Vec2::new(0.0, big * 0.42 + 18.0),
+                    r.center() + Vec2::new(0.0, big * 0.42 + 19.0),
                     Align2::CENTER_TOP,
-                    format!("{}×{} · {:.0}×{:.0} мм · ({}, {})", d.width, d.height, mw, mh, m.rect.x, m.rect.y),
+                    format!("{}×{} · {:.0}×{:.0} мм", d.width, d.height, mw, mh),
                     FontId::proportional(12.0),
-                    theme::MUTED,
+                    theme::TEXT.gamma_multiply(0.55),
                 );
+                // Desktop position in the corner.
+                let g = painter.layout_no_wrap(format!("{}, {}", m.rect.x, m.rect.y), FontId::monospace(11.0), theme::TEXT.gamma_multiply(0.7));
+                painter.galley(r.left_top() + Vec2::new(10.0, 8.0), g, theme::MUTED);
             }
         }
 
-        // Shared edges with their offset.
+        // Shared edges: a glowing seam with its offset.
         for e in find_edges(&mons) {
             let (a, b) = match e.axis {
                 Axis::Vertical => (self.to_screen(e.pos as f32, e.s0 as f32), self.to_screen(e.pos as f32, e.s1 as f32)),
                 Axis::Horizontal => (self.to_screen(e.s0 as f32, e.pos as f32), self.to_screen(e.s1 as f32, e.pos as f32)),
             };
-            painter.line_segment([a, b], Stroke::new(3.0, theme::GREEN));
+            painter.line_segment([a, b], Stroke::new(2.0, theme::GREEN));
             let off = e.start(&mons[e.b]) - e.start(&mons[e.a]);
             let mm = implied_offset_mm(&e, &mons, anchor_t(&e, self.anchor, None));
             let mid = a + (b - a) / 2.0;
             let text = format!("{:+} пикс. · {:+.1} мм", off as i32, mm);
             let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), theme::GREEN);
             let pill = egui::Rect::from_center_size(mid, galley.size() + Vec2::new(16.0, 8.0));
-            painter.rect(pill, CornerRadius::same(10), Color32::from_rgb(16, 40, 31), Stroke::new(1.0, theme::GREEN.gamma_multiply(0.5)), StrokeKind::Inside);
+            painter.rect(pill, CornerRadius::same(4), theme::PANEL, Stroke::new(1.0, theme::GREEN), StrokeKind::Inside);
             painter.galley(pill.center() - galley.size() / 2.0, galley, theme::GREEN);
         }
 
-        painter.text(
-            area.left_bottom() + Vec2::new(14.0, -12.0),
-            Align2::LEFT_BOTTOM,
-            "Перетаскивайте мониторы мышью · Alt — без прилипания · колесо — масштаб · правая кнопка — сдвиг вида",
-            FontId::proportional(12.0),
-            theme::MUTED,
-        );
+        self.canvas_overlays(ui, area);
     }
 
     fn draw_grid(&self, painter: &egui::Painter, area: egui::Rect) {
@@ -938,7 +999,7 @@ impl App {
         let step = [100.0, 500.0, 1000.0, 5000.0].into_iter().find(|s| s * self.view_scale >= 24.0).unwrap_or(10000.0);
         let to_desk = |p: Pos2| (p - self.view_offset.to_pos2()) / self.view_scale;
         let (a, b) = (to_desk(area.left_top()), to_desk(area.right_bottom()));
-        let color = Color32::from_rgb(34, 39, 52);
+        let color = Color32::from_rgb(52, 52, 58);
         let mut x = (a.x / step).floor() * step;
         while x <= b.x {
             let mut y = (a.y / step).floor() * step;
@@ -959,22 +1020,21 @@ impl eframe::App for App {
         self.live_tick(&ctx);
 
         egui::Panel::top("header")
-            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(16, 12)).stroke(Stroke::new(1.0, theme::STROKE)))
+            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(16, 10)).stroke(Stroke::new(1.0, theme::STROKE)))
             .show(ui, |ui| self.header(ui));
         egui::Panel::right("side")
             .resizable(false)
             .exact_size(392.0)
-            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(Margin::same(14)))
+            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(Margin { left: 14, right: 6, top: 14, bottom: 14 }))
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.side_panel(ui));
+                // Right margin inside the scroll area keeps cards clear of the scrollbar.
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    egui::Frame::new().inner_margin(Margin { left: 0, right: 10, top: 0, bottom: 0 }).show(ui, |ui| self.side_panel(ui));
+                });
             });
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(Margin { left: 14, right: 0, top: 12, bottom: 14 }))
-            .show(ui, |ui| {
-                self.canvas_toolbar(ui);
-                ui.add_space(6.0);
-                self.canvas(ui);
-            });
+            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(Margin { left: 14, right: 12, top: 14, bottom: 14 }))
+            .show(ui, |ui| self.canvas(ui));
     }
 }
 
