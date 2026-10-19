@@ -21,7 +21,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Выравнивание мониторов")
             .with_inner_size([1240.0, 780.0])
-            .with_min_inner_size([820.0, 520.0]),
+            .with_min_inner_size([820.0, 520.0])
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap_or_default()),
         ..Default::default()
     };
     eframe::run_native(
