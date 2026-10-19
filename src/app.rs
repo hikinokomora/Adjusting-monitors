@@ -678,35 +678,48 @@ impl App {
     // ---------------------------------------------------------------- canvas
 
     fn canvas_toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 18.0;
-            if theme::toggle(ui, &mut self.rulers, "Линейки на экранах").changed() {
-                self.push_overlay();
-            }
-            if theme::toggle(ui, &mut self.live, "Применять сразу").changed() {
-                self.save_config();
-            }
-            if theme::toggle(ui, &mut self.topmost, "Поверх окон").changed() {
-                let level = if self.topmost { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                if theme::ghost_button(ui, icon::FIT).on_hover_text("Показать всю раскладку").clicked() {
-                    self.fit_view = true;
-                }
-                if theme::segmented(
-                    ui,
-                    &mut self.anchor,
-                    &[(Anchor::Start, "Начало"), (Anchor::Center, "Центр"), (Anchor::End, "Конец"), (Anchor::Cursor, "Курсор")],
-                ) {
-                    self.save_config();
-                    self.push_overlay();
-                }
-                ui.label(RichText::new("Ноль линеек").color(theme::MUTED))
-                    .on_hover_text("Точка стыка, где курсор переходит без скачка. От неё отсчитываются миллиметры на линейках.");
+        // One row when there is room, otherwise the anchor picker goes to its own row.
+        if ui.available_width() >= 980.0 {
+            ui.horizontal(|ui| {
+                self.toggles(ui);
+                ui.add_space(10.0);
+                self.anchor_picker(ui);
             });
-        });
+        } else {
+            ui.horizontal(|ui| self.toggles(ui));
+            ui.horizontal(|ui| self.anchor_picker(ui));
+        }
+    }
+
+    fn toggles(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.x = 18.0;
+        if theme::toggle(ui, &mut self.rulers, "Линейки на экранах").changed() {
+            self.push_overlay();
+        }
+        if theme::toggle(ui, &mut self.live, "Применять сразу").changed() {
+            self.save_config();
+        }
+        if theme::toggle(ui, &mut self.topmost, "Поверх окон").changed() {
+            let level = if self.topmost { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        }
+    }
+
+    fn anchor_picker(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.label(RichText::new("Ноль линеек").color(theme::MUTED))
+            .on_hover_text("Точка стыка, где курсор переходит без скачка. От неё отсчитываются миллиметры на линейках.");
+        if theme::segmented(
+            ui,
+            &mut self.anchor,
+            &[(Anchor::Start, "Начало"), (Anchor::Center, "Центр"), (Anchor::End, "Конец"), (Anchor::Cursor, "Курсор")],
+        ) {
+            self.save_config();
+            self.push_overlay();
+        }
+        if theme::ghost_button(ui, icon::FIT).on_hover_text("Показать всю раскладку").clicked() {
+            self.fit_view = true;
+        }
     }
 
     fn bounds(&self, mons: &[Mon]) -> (i32, i32, i32, i32) {

@@ -185,7 +185,8 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T,
         .inner_margin(Margin::same(3))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            ui.horizontal(|ui| {
+            // Always left to right, even inside a right-to-left parent.
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 for (v, name) in options {
                     let sel = *value == *v;
                     let text = if sel { strong(*name).color(Color32::WHITE) } else { RichText::new(*name).color(MUTED) };
