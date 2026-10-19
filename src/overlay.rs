@@ -1,13 +1,15 @@
 //! Millimetre rulers drawn on the real screens along every shared edge.
 //!
-//! Each ruler is a small click-through topmost window that lives on its own thread with a plain
-//! Win32 message loop, so it keeps exact physical pixels regardless of what the UI toolkit does.
+//! Each ruler is a small topmost window that never takes focus. It lives on its own thread with
+//! a plain Win32 message loop, so it keeps exact physical pixels whatever the UI toolkit does.
+//! A ruler can be dragged or scrolled with the mouse wheel to shift its monitor along the edge.
 
 use std::cell::RefCell;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex, mpsc};
 
+use eframe::egui;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
@@ -18,30 +20,43 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    LWA_ALPHA, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassExW,
-    SW_SHOWNOACTIVATE, SetLayeredWindowAttributes, SetTimer, ShowWindow, TranslateMessage,
-    WM_APP, WM_ERASEBKGND, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    HWND_TOPMOST, IDC_SIZENS, IDC_SIZEWE, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE, MSG,
+    PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassExW, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SetCursor, SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow,
+    TranslateMessage, WM_APP, WM_CAPTURECHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_QUIT, WM_SETCURSOR, WM_TIMER,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::display::wide;
 use crate::layout::{Anchor, Axis, Edge, Mon, Rect, anchor_t};
 
-/// What the rulers should show: the layout currently applied in Windows.
+/// What the rulers should show.
 #[derive(Clone, Default)]
 pub struct OverlayData {
-    pub mons: Vec<Mon>,
+    /// Monitors where Windows has them now: this is where the ruler windows are placed.
+    pub applied: Vec<Mon>,
+    /// Monitors where the user has put them, maybe not applied yet: this is what the ticks show.
+    pub edited: Vec<Mon>,
     /// Short label of each monitor, e.g. `2`.
     pub labels: Vec<String>,
     pub scales: Vec<f32>,
+    /// Shared edges of the applied layout.
     pub edges: Vec<Edge>,
     pub anchor: Anchor,
 }
 
+/// Something the user did with a ruler.
+pub enum OverlayEvent {
+    /// Move a monitor by this many desktop pixels.
+    Shift { mon: usize, dx: i32, dy: i32 },
+}
+
 const WM_APP_REBUILD: u32 = WM_APP + 1;
-const HTTRANSPARENT: LRESULT = -1;
+const MK_SHIFT: usize = 0x0004;
 
 pub struct Overlay {
     shared: Arc<Mutex<Option<OverlayData>>>,
@@ -49,16 +64,17 @@ pub struct Overlay {
 }
 
 impl Overlay {
-    pub fn start() -> Self {
+    pub fn start(ctx: egui::Context) -> (Self, mpsc::Receiver<OverlayEvent>) {
         let shared = Arc::new(Mutex::new(None));
-        let (tx, rx) = mpsc::channel();
+        let (tid_tx, tid_rx) = mpsc::channel();
+        let (ev_tx, ev_rx) = mpsc::channel();
         let thread_shared = shared.clone();
-        std::thread::spawn(move || unsafe { run(thread_shared, tx) });
-        let thread_id = rx.recv().unwrap_or(0);
-        Self { shared, thread_id }
+        std::thread::spawn(move || unsafe { run(thread_shared, tid_tx, ev_tx, ctx) });
+        let thread_id = tid_rx.recv().unwrap_or(0);
+        (Self { shared, thread_id }, ev_rx)
     }
 
-    /// Replaces the rulers; pass `OverlayData::default()` to hide them.
+    /// Replaces what the rulers show; pass `OverlayData::default()` to hide them.
     pub fn set(&self, data: OverlayData) {
         *self.shared.lock().unwrap() = Some(data);
         unsafe { PostThreadMessageW(self.thread_id, WM_APP_REBUILD, 0, 0) };
@@ -89,23 +105,104 @@ struct Strip {
     rect: Rect,
 }
 
-#[derive(Default)]
+struct Drag {
+    mon: usize,
+    axis: Axis,
+    start: (i32, i32),
+    /// Pointer movement along the edge since the press, in pixels.
+    delta: i32,
+    /// Zero of the rulers frozen at the press, so the dragged ruler follows the pointer 1:1.
+    t0: Vec<f64>,
+}
+
 struct State {
     data: OverlayData,
     strips: Vec<Strip>,
     cursor: (i32, i32),
+    hovered: HWND,
+    drag: Option<Drag>,
+    /// Shift already sent to the app but not yet reflected in `data`.
+    pending: Option<(usize, i32, i32)>,
+    events: Option<(mpsc::Sender<OverlayEvent>, egui::Context)>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            data: OverlayData::default(),
+            strips: Vec::new(),
+            cursor: (i32::MIN, i32::MIN),
+            hovered: null_mut(),
+            drag: None,
+            pending: None,
+            events: None,
+        }
+    }
+}
+
+impl State {
+    /// Edited monitor position including a drag in progress and shifts not yet confirmed.
+    fn preview(&self, i: usize) -> Mon {
+        let mut m = self.data.edited[i];
+        if let Some((mon, dx, dy)) = self.pending {
+            if mon == i {
+                m.rect.x += dx;
+                m.rect.y += dy;
+            }
+        }
+        if let Some(d) = &self.drag {
+            if d.mon == i {
+                match d.axis {
+                    Axis::Vertical => m.rect.y -= d.delta,
+                    Axis::Horizontal => m.rect.x -= d.delta,
+                }
+            }
+        }
+        m
+    }
+
+    /// The edge with its shared span taken from the preview positions.
+    fn preview_edge(&self, e: &Edge) -> Edge {
+        let (a, b) = (self.preview(e.a).rect, self.preview(e.b).rect);
+        let (s0, s1) = match e.axis {
+            Axis::Vertical => (a.y.max(b.y), a.bottom().min(b.bottom())),
+            Axis::Horizontal => (a.x.max(b.x), a.right().min(b.right())),
+        };
+        Edge { s0, s1: s1.max(s0), ..*e }
+    }
+
+    fn send(&mut self, mon: usize, dx: i32, dy: i32) {
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        let (px, py) = match self.pending {
+            Some((m, x, y)) if m == mon => (x, y),
+            _ => (0, 0),
+        };
+        self.pending = Some((mon, px + dx, py + dy));
+        if let Some((tx, ctx)) = &self.events {
+            let _ = tx.send(OverlayEvent::Shift { mon, dx, dy });
+            ctx.request_repaint();
+        }
+    }
 }
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
 }
 
-unsafe fn run(shared: Arc<Mutex<Option<OverlayData>>>, tx: mpsc::Sender<u32>) {
+unsafe fn run(
+    shared: Arc<Mutex<Option<OverlayData>>>,
+    tid: mpsc::Sender<u32>,
+    events: mpsc::Sender<OverlayEvent>,
+    ctx: egui::Context,
+) {
     unsafe {
         let mut msg: MSG = zeroed();
         // Make sure the thread has a message queue before anyone posts to it.
         PeekMessageW(&mut msg, null_mut(), 0, 0, PM_NOREMOVE);
-        let _ = tx.send(GetCurrentThreadId());
+        STATE.with(|s| s.borrow_mut().events = Some((events, ctx)));
+        let _ = tid.send(GetCurrentThreadId());
 
         let hinst = GetModuleHandleW(null());
         let class = wide("MonitorAlignerRuler");
@@ -116,7 +213,7 @@ unsafe fn run(shared: Arc<Mutex<Option<OverlayData>>>, tx: mpsc::Sender<u32>) {
         wc.lpszClassName = class.as_ptr();
         RegisterClassExW(&wc);
 
-        SetTimer(null_mut(), 0, 33, None);
+        SetTimer(null_mut(), 0, 30, None);
 
         loop {
             let r = GetMessageW(&mut msg, null_mut(), 0, 0);
@@ -144,47 +241,66 @@ unsafe fn run(shared: Arc<Mutex<Option<OverlayData>>>, tx: mpsc::Sender<u32>) {
     }
 }
 
+/// Puts ruler windows where the data says, reusing existing windows to avoid flicker.
 unsafe fn rebuild(data: OverlayData, hinst: *mut core::ffi::c_void, class: &[u16]) {
-    let old: Vec<HWND> = STATE.with(|s| {
-        let mut s = s.borrow_mut();
-        std::mem::take(&mut s.strips).into_iter().map(|st| st.hwnd).collect()
-    });
-    for h in old {
-        unsafe { DestroyWindow(h) };
-    }
-
     let mut strips = layout_strips(&data);
+    let old: Vec<Strip> = STATE.with(|s| std::mem::take(&mut s.borrow_mut().strips));
+
+    let mut old = old.into_iter();
+    let mut created = Vec::new();
     let title = wide("Ruler");
     for st in &mut strips {
         let r = st.rect;
-        st.hwnd = unsafe {
-            CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                class.as_ptr(),
-                title.as_ptr(),
-                WS_POPUP,
-                r.x,
-                r.y,
-                r.w,
-                r.h,
-                null_mut(),
-                null_mut(),
-                hinst,
-                null(),
-            )
-        };
-        if !st.hwnd.is_null() {
-            unsafe { SetLayeredWindowAttributes(st.hwnd, 0, 235, LWA_ALPHA) };
+        match old.next() {
+            Some(prev) => {
+                st.hwnd = prev.hwnd;
+                if prev.rect != r {
+                    unsafe { SetWindowPos(st.hwnd, HWND_TOPMOST, r.x, r.y, r.w, r.h, SWP_NOACTIVATE) };
+                }
+            }
+            None => {
+                st.hwnd = unsafe {
+                    CreateWindowExW(
+                        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                        class.as_ptr(),
+                        title.as_ptr(),
+                        WS_POPUP,
+                        r.x,
+                        r.y,
+                        r.w,
+                        r.h,
+                        null_mut(),
+                        null_mut(),
+                        hinst,
+                        null(),
+                    )
+                };
+                if !st.hwnd.is_null() {
+                    unsafe { SetLayeredWindowAttributes(st.hwnd, 0, 240, LWA_ALPHA) };
+                    created.push(st.hwnd);
+                }
+            }
         }
     }
-    let hwnds: Vec<HWND> = strips.iter().map(|s| s.hwnd).filter(|h| !h.is_null()).collect();
+    for extra in old {
+        unsafe { DestroyWindow(extra.hwnd) };
+    }
+
+    let hwnds: Vec<HWND> = strips.iter().map(|s| s.hwnd).collect();
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         s.data = data;
         s.strips = strips;
+        s.pending = None;
+        if s.drag.as_ref().is_some_and(|d| d.mon >= s.data.edited.len()) {
+            s.drag = None;
+        }
     });
-    for h in hwnds {
+    for h in created {
         unsafe { ShowWindow(h, SW_SHOWNOACTIVATE) };
+    }
+    for h in hwnds {
+        unsafe { InvalidateRect(h, null(), 0) };
     }
 }
 
@@ -195,8 +311,8 @@ fn layout_strips(d: &OverlayData) -> Vec<Strip> {
             Axis::Vertical => [(e.a, Side::Right), (e.b, Side::Left)],
             Axis::Horizontal => [(e.a, Side::Bottom), (e.b, Side::Top)],
         } {
-            let depth = (96.0 * d.scales.get(mi).copied().unwrap_or(1.0)).round() as i32;
-            let m = &d.mons[mi].rect;
+            let m = &d.applied[mi].rect;
+            let depth = (104.0 * d.scales.get(mi).copied().unwrap_or(1.0)).round() as i32;
             let depth = depth.min(match e.axis {
                 Axis::Vertical => m.w / 3,
                 Axis::Horizontal => m.h / 3,
@@ -214,6 +330,10 @@ fn layout_strips(d: &OverlayData) -> Vec<Strip> {
     out
 }
 
+fn contains(r: &Rect, p: (i32, i32)) -> bool {
+    p.0 >= r.x && p.0 < r.right() && p.1 >= r.y && p.1 < r.bottom()
+}
+
 unsafe fn tick() {
     let mut p: POINT = unsafe { zeroed() };
     if unsafe { GetCursorPos(&mut p) } == 0 {
@@ -225,11 +345,30 @@ unsafe fn tick() {
             return Vec::new();
         }
         s.cursor = (p.x, p.y);
+        s.hovered = s
+            .strips
+            .iter()
+            .find(|st| contains(&st.rect, s.cursor))
+            .map(|st| st.hwnd)
+            .unwrap_or(null_mut());
         s.strips.iter().map(|st| st.hwnd).collect()
     });
     for h in hwnds {
         unsafe { InvalidateRect(h, null(), 0) };
     }
+}
+
+fn invalidate_all() {
+    let hwnds: Vec<HWND> = STATE.with(|s| s.borrow().strips.iter().map(|st| st.hwnd).collect());
+    for h in hwnds {
+        unsafe { InvalidateRect(h, null(), 0) };
+    }
+}
+
+fn cursor_pos() -> (i32, i32) {
+    let mut p: POINT = unsafe { zeroed() };
+    unsafe { GetCursorPos(&mut p) };
+    (p.x, p.y)
 }
 
 unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -249,7 +388,95 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 0
             }
             WM_ERASEBKGND => 1,
-            WM_NCHITTEST => HTTRANSPARENT,
+            WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+            WM_SETCURSOR => {
+                let vertical = STATE.with(|s| {
+                    let s = s.borrow();
+                    s.strips
+                        .iter()
+                        .find(|st| st.hwnd == h)
+                        .map(|st| matches!(st.side, Side::Left | Side::Right))
+                        .unwrap_or(true)
+                });
+                SetCursor(LoadCursorW(null_mut(), if vertical { IDC_SIZENS } else { IDC_SIZEWE }));
+                1
+            }
+            WM_LBUTTONDOWN => {
+                let started = STATE.with(|s| {
+                    let mut s = s.borrow_mut();
+                    let Some(st) = s.strips.iter().find(|st| st.hwnd == h) else { return false };
+                    let (mon, axis) = (st.mon, s.data.edges[st.edge].axis);
+                    // Freeze every edge's zero where it is now.
+                    let t0: Vec<f64> = s
+                        .data
+                        .edges
+                        .iter()
+                        .map(|e| anchor_t(&s.preview_edge(e), s.data.anchor, Some(s.cursor)))
+                        .collect();
+                    s.drag = Some(Drag { mon, axis, start: cursor_pos(), delta: 0, t0 });
+                    true
+                });
+                if started {
+                    SetCapture(h);
+                }
+                0
+            }
+            WM_MOUSEMOVE => {
+                let moved = STATE.with(|s| {
+                    let mut s = s.borrow_mut();
+                    let Some(d) = s.drag.as_mut() else { return false };
+                    let p = cursor_pos();
+                    let delta = match d.axis {
+                        Axis::Vertical => p.1 - d.start.1,
+                        Axis::Horizontal => p.0 - d.start.0,
+                    };
+                    let changed = delta != d.delta;
+                    d.delta = delta;
+                    changed
+                });
+                if moved {
+                    invalidate_all();
+                }
+                0
+            }
+            WM_LBUTTONUP | WM_CAPTURECHANGED => {
+                let was_dragging = STATE.with(|s| {
+                    let mut s = s.borrow_mut();
+                    let Some(d) = s.drag.take() else { return false };
+                    // Ruler moved down/right by `delta` means the monitor's desktop start moves up/left.
+                    match d.axis {
+                        Axis::Vertical => s.send(d.mon, 0, -d.delta),
+                        Axis::Horizontal => s.send(d.mon, -d.delta, 0),
+                    }
+                    true
+                });
+                if was_dragging && msg == WM_LBUTTONUP {
+                    ReleaseCapture();
+                }
+                invalidate_all();
+                0
+            }
+            WM_MOUSEWHEEL => {
+                let wheel = ((wp >> 16) & 0xFFFF) as u16 as i16 as i32;
+                let step = if wp & MK_SHIFT != 0 { 10 } else { 1 };
+                let notches = if wheel.abs() >= 120 { wheel / 120 } else { wheel.signum() };
+                STATE.with(|s| {
+                    let mut s = s.borrow_mut();
+                    if s.drag.is_some() {
+                        return;
+                    }
+                    let Some(st) = s.strips.iter().find(|st| st.hwnd == h) else { return };
+                    let (mon, axis) = (st.mon, s.data.edges[st.edge].axis);
+                    // Wheel up moves the ruler up, i.e. the monitor's desktop start down.
+                    let d = notches * step;
+                    match axis {
+                        Axis::Vertical => s.send(mon, 0, d),
+                        Axis::Horizontal => s.send(mon, d, 0),
+                    }
+                });
+                invalidate_all();
+                0
+            }
             _ => DefWindowProcW(h, msg, wp, lp),
         }
     }
@@ -259,13 +486,15 @@ const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
 }
 
-const BG: u32 = rgb(20, 22, 28);
-const EDGE: u32 = rgb(60, 200, 255);
-const TICK: u32 = rgb(235, 235, 235);
-const TICK_MINOR: u32 = rgb(150, 150, 160);
-const ZERO: u32 = rgb(255, 70, 70);
-const CURSOR: u32 = rgb(255, 210, 40);
-const LABEL_BG: u32 = rgb(40, 44, 56);
+const BG: u32 = rgb(16, 18, 24);
+const BG_HOVER: u32 = rgb(24, 28, 38);
+const EDGE: u32 = rgb(91, 141, 255);
+const TICK: u32 = rgb(232, 235, 242);
+const TICK_MINOR: u32 = rgb(120, 128, 146);
+const ZERO: u32 = rgb(255, 92, 92);
+const CURSOR: u32 = rgb(255, 204, 64);
+const LABEL_BG: u32 = rgb(34, 39, 52);
+const MUTED: u32 = rgb(139, 147, 167);
 
 unsafe fn line(hdc: HDC, color: u32, width: i32, a: (i32, i32), b: (i32, i32)) {
     unsafe {
@@ -318,14 +547,20 @@ unsafe fn paint(hdc: HDC, st: &Strip, s: &State) {
     let r = st.rect;
     let (w, h) = (r.w, r.h);
     let d = &s.data;
-    let (Some(m), Some(e)) = (d.mons.get(st.mon), d.edges.get(st.edge)) else { return };
+    let Some(e) = d.edges.get(st.edge) else { return };
+    if st.mon >= d.edited.len() {
+        return;
+    }
+    let applied = d.applied[st.mon];
+    let m = s.preview(st.mon);
     let scale = d.scales.get(st.mon).copied().unwrap_or(1.0);
     let px = |v: f32| (v * scale).round() as i32;
 
     let vertical = e.axis == Axis::Vertical;
-    let ppmm = e.ppmm(m);
-    // Desktop coordinate of local position 0 along the ruler, and the ruler's length and depth.
-    let origin = if vertical { r.y } else { r.x } as f64;
+    let ppmm = e.ppmm(&m);
+    // Window pixels map to the applied desktop; ticks are placed in the edited desktop.
+    let shift = e.start(&m) - e.start(&applied);
+    let origin = if vertical { r.y } else { r.x } as f64 + shift;
     let len = if vertical { h } else { w };
     let depth = if vertical { w } else { h };
     // (position along the edge, distance from the edge) -> local window pixel.
@@ -337,12 +572,14 @@ unsafe fn paint(hdc: HDC, st: &Strip, s: &State) {
             Side::Top => (a, dist),
         }
     };
+    let dragging_me = s.drag.as_ref().is_some_and(|dr| dr.mon == st.mon);
+    let hovered = s.hovered == st.hwnd || dragging_me;
 
     unsafe {
         let mem = CreateCompatibleDC(hdc);
         let bmp = CreateCompatibleBitmap(hdc, w, h);
         let old_bmp = SelectObject(mem, bmp);
-        fill(mem, BG, RECT { left: 0, top: 0, right: w, bottom: h });
+        fill(mem, if hovered { BG_HOVER } else { BG }, RECT { left: 0, top: 0, right: w, bottom: h });
 
         let small = font(px(12.0), FW_NORMAL as i32);
         let bold = font(px(13.0), FW_SEMIBOLD as i32);
@@ -361,25 +598,26 @@ unsafe fn paint(hdc: HDC, st: &Strip, s: &State) {
                 Side::Top => (x - tw / 2, y),
             };
             if boxed {
-                fill(mem, LABEL_BG, RECT { left: x - 3, top: y, right: x + tw + 3, bottom: y + th });
+                fill(mem, LABEL_BG, RECT { left: x - 4, top: y, right: x + tw + 4, bottom: y + th });
             }
             SetTextColor(mem, color);
             TextOutW(mem, x, y, t.as_ptr(), t.len() as i32);
         };
 
-        let t0 = anchor_t(e, d.anchor, Some(s.cursor));
+        let t0 = match &s.drag {
+            Some(dr) => dr.t0.get(st.edge).copied().unwrap_or(0.0),
+            None => anchor_t(&s.preview_edge(e), d.anchor, Some(s.cursor)),
+        };
         let lo = ((origin - t0) / ppmm).floor() as i64 - 1;
         let hi = ((origin + len as f64 - t0) / ppmm).ceil() as i64 + 1;
         let fine = ppmm >= 2.5;
         let label_dist = px(34.0);
         for l in lo..=hi {
             let a = (t0 + l as f64 * ppmm - origin).round() as i32;
-            if a < 0 || a >= len {
+            if a < 0 || a >= len || l == 0 {
                 continue;
             }
-            let (tick_len, color) = if l == 0 {
-                continue;
-            } else if l % 10 == 0 {
+            let (tick_len, color) = if l % 10 == 0 {
                 (px(28.0), TICK)
             } else if l % 5 == 0 {
                 (px(18.0), TICK)
@@ -389,13 +627,13 @@ unsafe fn paint(hdc: HDC, st: &Strip, s: &State) {
                 continue;
             };
             line(mem, color, 1, to_xy(a, 0), to_xy(a, tick_len));
-            // Keep the top of vertical rulers free for the neighbour's number.
+            // Keep the start of vertical rulers free for the neighbour's number.
             if l % 10 == 0 && !(vertical && a < px(26.0)) {
                 label(&l.to_string(), a, label_dist, TICK, false);
             }
         }
 
-        // The zero: on both sides of the edge it marks the same physical height when aligned.
+        // The zero: on both sides of the edge it marks the same physical point when aligned.
         let a0 = (t0 - origin).round() as i32;
         if (0..len).contains(&a0) {
             line(mem, ZERO, px(2.0).max(1), to_xy(a0, 0), to_xy(a0, depth));
@@ -406,12 +644,12 @@ unsafe fn paint(hdc: HDC, st: &Strip, s: &State) {
 
         // Where the cursor would cross the edge, in millimetres from the zero on this panel.
         let tc = e.along(s.cursor) as f64;
-        let ac = (tc - origin).round() as i32;
-        if (0..len).contains(&ac) {
+        let ac = (tc - (if vertical { r.y } else { r.x }) as f64).round() as i32;
+        if (0..len).contains(&ac) && s.drag.is_none() {
             line(mem, CURSOR, 1, to_xy(ac, 0), to_xy(ac, depth));
-            let mm = (tc - t0) / ppmm;
-            let shift = if vertical { px(10.0) } else { 0 };
-            label(&format!("{mm:+.1}"), ac + shift, px(56.0), CURSOR, true);
+            let mm = (tc + shift - t0) / ppmm;
+            let offset = if vertical { px(10.0) } else { 0 };
+            label(&format!("{mm:+.1}"), ac + offset, px(58.0), CURSOR, true);
         }
 
         // The edge itself and the neighbour's number.
@@ -419,7 +657,24 @@ unsafe fn paint(hdc: HDC, st: &Strip, s: &State) {
         let other = d.labels.get(e.other(st.mon)).cloned().unwrap_or_default();
         SelectObject(mem, bold);
         let head_at = if vertical { px(12.0) } else { px(40.0) };
-        label(&format!("→ {other}"), head_at, px(56.0), EDGE, true);
+        label(&format!("→ {other}"), head_at, px(58.0), EDGE, true);
+
+        // While dragging, show how far the monitor has moved.
+        if let Some(dr) = s.drag.as_ref().filter(|dr| dr.mon == st.mon) {
+            let mm = dr.delta as f64 / ppmm;
+            let at = (if vertical { s.cursor.1 - r.y } else { s.cursor.0 - r.x }).clamp(px(30.0), len - px(30.0));
+            if vertical {
+                label(&format!("{:+} пикс.", dr.delta), at - px(9.0), px(40.0), CURSOR, true);
+                label(&format!("{mm:+.1} мм"), at + px(9.0), px(40.0), CURSOR, true);
+            } else {
+                label(&format!("{:+} пикс. · {mm:+.1} мм", dr.delta), at, px(58.0), CURSOR, true);
+            }
+        } else if hovered && s.drag.is_none() {
+            SelectObject(mem, small);
+            let at = if vertical { len - px(14.0) } else { len - px(90.0) };
+            let hint = if vertical { "тяните ↕" } else { "тяните ↔ или колесо" };
+            label(hint, at, px(40.0), MUTED, true);
+        }
 
         BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
 

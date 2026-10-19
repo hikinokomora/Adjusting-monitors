@@ -1,24 +1,27 @@
 //! The layout editor window.
 
 use std::collections::HashMap;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Key, PointerButton, Pos2, Sense, Stroke,
-    StrokeKind, Vec2,
+    self, Align, Align2, Color32, CornerRadius, FontId, Key, Layout, Margin, PointerButton, Pos2,
+    RichText, Sense, Shape, Stroke, StrokeKind, Vec2,
 };
 
 use crate::config::Config;
 use crate::display::{self, Display};
 use crate::layout::{
-    Anchor, Axis, Edge, Mon, Rect, anchor_t, find_edges, implied_offset_mm, mismatch_mm,
+    Anchor, Axis, Edge, Mon, Rect, anchor_t, attach, find_edges, implied_offset_mm, mismatch_mm,
     target_start,
 };
-use crate::overlay::{Overlay, OverlayData};
+use crate::overlay::{Overlay, OverlayData, OverlayEvent};
+use crate::theme::{self, icon};
 
 /// Assumed pixel pitch when the monitor reports no size at all.
 const GUESS_MM_PER_PX: f32 = 0.27;
-const LIVE_DELAY: Duration = Duration::from_millis(350);
+/// Pause after the last change before it is applied in live mode.
+const LIVE_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SizeSource {
@@ -33,13 +36,32 @@ enum Step {
     Mm,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusKind {
+    Info,
+    Busy,
+    Ok,
+    Warn,
+    Error,
+}
+
 struct Drag {
     index: usize,
     start_mouse: Pos2,
     start_pos: (i32, i32),
 }
 
+/// An apply running on a worker thread.
+struct ApplyJob {
+    rx: mpsc::Receiver<Result<(), String>>,
+    /// Edited positions at the moment of sending, before moving the primary to (0, 0).
+    sent: Vec<(i32, i32)>,
+    /// How far the whole desktop moves so that the primary ends up at (0, 0).
+    shift: (i32, i32),
+}
+
 pub struct App {
+    ctx: egui::Context,
     config: Config,
     /// Layout as it currently is in Windows.
     displays: Vec<Display>,
@@ -57,8 +79,10 @@ pub struct App {
     anchor: Anchor,
     changed_at: Option<Instant>,
     measured: HashMap<(String, String), f32>,
-    status: String,
+    status: (StatusKind, String),
     overlay: Overlay,
+    overlay_events: mpsc::Receiver<OverlayEvent>,
+    applying: Option<ApplyJob>,
     // Canvas view: screen position of desktop (0, 0) and screen points per desktop pixel.
     view_offset: Vec2,
     view_scale: f32,
@@ -69,9 +93,11 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        setup_fonts(&cc.egui_ctx);
+        theme::setup(&cc.egui_ctx);
         let config = Config::load();
+        let (overlay, overlay_events) = Overlay::start(cc.egui_ctx.clone());
         let mut app = Self {
+            ctx: cc.egui_ctx.clone(),
             live: config.live,
             anchor: config.anchor,
             config,
@@ -85,8 +111,10 @@ impl App {
             topmost: false,
             changed_at: None,
             measured: HashMap::new(),
-            status: String::new(),
-            overlay: Overlay::start(),
+            status: (StatusKind::Info, String::new()),
+            overlay,
+            overlay_events,
+            applying: None,
             view_offset: Vec2::ZERO,
             view_scale: 0.1,
             fit_view: true,
@@ -96,11 +124,11 @@ impl App {
         app.reload();
         app.initial = app.displays.iter().map(|d| (d.device_name.clone(), d.x, d.y)).collect();
         app.selected = app.displays.iter().position(|d| !d.primary).or(Some(0));
-        app.status = format!("Найдено мониторов: {}", app.displays.len());
+        app.status = (StatusKind::Info, format!("Найдено мониторов: {}", app.displays.len()));
         app
     }
 
-    /// Re-reads the layout from Windows, keeping the selection.
+    /// Re-reads the layout from Windows, dropping unapplied edits but keeping the selection.
     fn reload(&mut self) {
         let selected_name = self.selected.and_then(|i| self.displays.get(i)).map(|d| d.device_name.clone());
         self.displays = display::enumerate();
@@ -153,10 +181,11 @@ impl App {
             self.overlay.set(OverlayData::default());
             return;
         }
-        let mons = self.applied_mons();
+        let applied = self.applied_mons();
         self.overlay.set(OverlayData {
-            edges: find_edges(&mons),
-            mons,
+            edges: find_edges(&applied),
+            applied,
+            edited: self.edited_mons(),
             labels: self.displays.iter().map(|d| d.number.to_string()).collect(),
             scales: self.displays.iter().map(|d| d.dpi_scale).collect(),
             anchor: self.anchor,
@@ -165,35 +194,89 @@ impl App {
 
     fn mark_changed(&mut self) {
         self.changed_at = Some(Instant::now());
+        self.push_overlay();
+    }
+
+    /// Pulls a monitor that floats free or overlaps back to the nearest valid spot.
+    fn attach(&mut self, i: usize) {
+        let others: Vec<Rect> = (0..self.displays.len()).filter(|&j| j != i).map(|j| self.mon(j, self.pos[j]).rect).collect();
+        let p = attach(self.mon(i, self.pos[i]).rect, &others);
+        if p != self.pos[i] {
+            self.pos[i] = p;
+            self.mark_changed();
+        }
     }
 
     fn apply(&mut self) {
+        if self.applying.is_some() || self.displays.is_empty() {
+            return;
+        }
+        self.changed_at = None;
+        for i in 0..self.displays.len() {
+            self.attach(i);
+        }
         self.changed_at = None;
         // Windows wants the primary display at (0, 0); everything else is relative to it.
         let primary = self.displays.iter().position(|d| d.primary).unwrap_or(0);
-        let (px, py) = self.pos[primary];
+        let shift = self.pos[primary];
         let wanted: Vec<(String, i32, i32)> = self
             .displays
             .iter()
             .zip(&self.pos)
-            .map(|(d, &(x, y))| (d.device_name.clone(), x - px, y - py))
+            .map(|(d, &(x, y))| (d.device_name.clone(), x - shift.0, y - shift.1))
             .collect();
-        let result = display::apply_positions(&wanted);
-        self.reload();
-        // Keep the picture still on the canvas if the origin moved.
-        self.view_offset += Vec2::new(px as f32, py as f32) * self.view_scale;
-        self.status = match result {
-            Err(e) => format!("Ошибка: {e}"),
-            Ok(()) => {
-                let adjusted = wanted.iter().any(|(n, x, y)| {
-                    self.displays.iter().any(|d| d.device_name == *n && (d.x, d.y) != (*x, *y))
-                });
-                if adjusted {
-                    "Применено, но Windows поправил положение (мониторы должны касаться друг друга и не перекрываться)".into()
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(display::apply_positions(&wanted));
+            ctx.request_repaint();
+        });
+        self.applying = Some(ApplyJob { rx, sent: self.pos.clone(), shift });
+        self.status = (StatusKind::Busy, "Применяю…".into());
+    }
+
+    fn poll_apply(&mut self) {
+        let Some(job) = &self.applying else { return };
+        let Ok(result) = job.rx.try_recv() else { return };
+        let job = self.applying.take().unwrap();
+        let (sx, sy) = job.shift;
+        let edits = self.pos.clone();
+        let fresh = display::enumerate();
+        if fresh.len() != edits.len() || fresh.iter().zip(&self.displays).any(|(a, b)| a.device_name != b.device_name) {
+            self.reload();
+            self.fit_view = true;
+        } else {
+            self.displays = fresh;
+            // Keep edits made while the apply was running; everything else follows Windows.
+            let mut pending = false;
+            for (i, d) in self.displays.iter().enumerate() {
+                if edits[i] == job.sent[i] {
+                    self.pos[i] = (d.x, d.y);
                 } else {
-                    "Применено".into()
+                    self.pos[i] = (edits[i].0 - sx, edits[i].1 - sy);
+                    pending = true;
                 }
             }
+            // Keep the picture still on the canvas if the origin moved.
+            self.view_offset += Vec2::new(sx as f32, sy as f32) * self.view_scale;
+            if let Some(d) = &mut self.drag {
+                d.start_pos = (d.start_pos.0 - sx, d.start_pos.1 - sy);
+            }
+            if pending {
+                self.mark_changed();
+            } else {
+                self.push_overlay();
+            }
+        }
+        let adjusted = self
+            .displays
+            .iter()
+            .zip(&job.sent)
+            .any(|(d, &(x, y))| (d.x, d.y) != (x - sx, y - sy));
+        self.status = match result {
+            Err(e) => (StatusKind::Error, format!("Ошибка: {e}")),
+            Ok(()) if adjusted => (StatusKind::Warn, "Windows поправил положение мониторов".into()),
+            Ok(()) => (StatusKind::Ok, "Применено".into()),
         };
     }
 
@@ -203,8 +286,8 @@ impl App {
                 self.pos[i] = (*x, *y);
             }
         }
+        self.push_overlay();
         self.apply();
-        self.status = "Возвращено положение, которое было при запуске".into();
     }
 
     fn step_px(&self, i: usize, axis_x: bool) -> i32 {
@@ -225,7 +308,19 @@ impl App {
         self.mark_changed();
     }
 
-    fn handle_keys(&mut self, ctx: &egui::Context) {
+    fn handle_input(&mut self, ctx: &egui::Context) {
+        while let Ok(ev) = self.overlay_events.try_recv() {
+            match ev {
+                OverlayEvent::Shift { mon, dx, dy } if mon < self.pos.len() => {
+                    self.pos[mon].0 += dx;
+                    self.pos[mon].1 += dy;
+                    self.selected = Some(mon);
+                    self.mark_changed();
+                }
+                _ => {}
+            }
+        }
+
         let Some(i) = self.selected else { return };
         if ctx.egui_wants_keyboard_input() {
             return;
@@ -259,14 +354,14 @@ impl App {
         if !self.live {
             return;
         }
-        if self.drag.is_none() && t.elapsed() >= LIVE_DELAY {
+        if self.drag.is_none() && self.applying.is_none() && t.elapsed() >= LIVE_DELAY {
             if self.has_changes() {
                 self.apply();
             } else {
                 self.changed_at = None;
             }
         } else {
-            ctx.request_repaint_after(Duration::from_millis(60));
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
 
@@ -276,141 +371,193 @@ impl App {
         self.config.save();
     }
 
-    // ---------------------------------------------------------------- toolbar
+    // ---------------------------------------------------------------- header
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            let changes = self.has_changes();
-            if ui
-                .add_enabled(changes, egui::Button::new("✔ Применить"))
-                .on_hover_text("Записать новое положение мониторов в Windows (Enter)")
-                .clicked()
-            {
-                self.apply();
-            }
-            if ui.add_enabled(changes, egui::Button::new("Сбросить правки")).clicked() {
-                self.pos = self.displays.iter().map(|d| (d.x, d.y)).collect();
-                self.changed_at = None;
-            }
-            if ui
-                .button("Как было при запуске")
-                .on_hover_text("Вернуть раскладку, которая была до запуска программы")
-                .clicked()
-            {
-                self.revert_to_initial();
-            }
-            if ui.button("⟳ Обновить").on_hover_text("Перечитать мониторы из Windows").clicked() {
-                self.reload();
-                self.fit_view = true;
-                self.status = format!("Найдено мониторов: {}", self.displays.len());
-            }
-            if ui.button("Вписать").on_hover_text("Показать всю раскладку").clicked() {
-                self.fit_view = true;
-            }
-
-            ui.separator();
-            if ui
-                .checkbox(&mut self.live, "Применять сразу")
-                .on_hover_text("Каждый сдвиг сразу применяется в Windows")
-                .changed()
-            {
-                self.save_config();
-            }
-            if ui
-                .checkbox(&mut self.rulers, "Линейки на экранах")
-                .on_hover_text("Показать миллиметровые линейки вдоль стыков на самих мониторах")
-                .changed()
-            {
-                self.push_overlay();
-            }
-            if ui.checkbox(&mut self.topmost, "Поверх окон").changed() {
-                let level = if self.topmost {
-                    egui::WindowLevel::AlwaysOnTop
-                } else {
-                    egui::WindowLevel::Normal
-                };
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-            }
-
-            ui.separator();
-            ui.label("Ноль линеек:");
-            let before = self.anchor;
-            egui::ComboBox::from_id_salt("anchor")
-                .selected_text(anchor_name(self.anchor))
-                .show_ui(ui, |ui| {
-                    for a in [Anchor::Start, Anchor::Center, Anchor::End, Anchor::Cursor] {
-                        ui.selectable_value(&mut self.anchor, a, anchor_name(a));
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "Точка стыка, где курсор переходит без скачка. От неё отсчитываются миллиметры на линейках.",
+    fn header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::hover());
+            ui.painter().rect_filled(r, CornerRadius::same(10), theme::ACCENT_DIM);
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, icon::RULER, FontId::proportional(19.0), theme::ACCENT);
+            ui.add_space(4.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(theme::strong("Выравнивание мониторов").size(16.0));
+                let (x0, y0, x1, y1) = self.bounds(&self.applied_mons());
+                ui.label(
+                    RichText::new(format!("{} {} · рабочий стол {}×{}", self.displays.len(), monitors_word(self.displays.len()), x1 - x0, y1 - y0))
+                        .size(12.0)
+                        .color(theme::MUTED),
                 );
-            if self.anchor != before {
-                self.save_config();
-                self.push_overlay();
-            }
+            });
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let changes = self.has_changes();
+                if theme::primary_button(ui, &format!("{}  Применить", icon::CHECK), changes && self.applying.is_none())
+                    .on_hover_text("Записать положение мониторов в Windows (Enter)")
+                    .clicked()
+                {
+                    self.apply();
+                }
+                if theme::ghost_button(ui, &format!("{}  Как было", icon::HISTORY))
+                    .on_hover_text("Вернуть раскладку, которая была при запуске программы")
+                    .clicked()
+                {
+                    self.revert_to_initial();
+                }
+                if changes
+                    && theme::ghost_button(ui, &format!("{}  Сбросить", icon::UNDO))
+                        .on_hover_text("Забыть неприменённые правки")
+                        .clicked()
+                {
+                    self.pos = self.displays.iter().map(|d| (d.x, d.y)).collect();
+                    self.changed_at = None;
+                    self.push_overlay();
+                }
+                if theme::ghost_button(ui, icon::REFRESH).on_hover_text("Перечитать мониторы из Windows").clicked() {
+                    self.reload();
+                    self.fit_view = true;
+                    self.status = (StatusKind::Info, format!("Найдено мониторов: {}", self.displays.len()));
+                }
+                ui.add_space(8.0);
+                let (kind, text) = if self.applying.is_some() {
+                    (StatusKind::Busy, "Применяю…".to_string())
+                } else if changes {
+                    (StatusKind::Warn, if self.live { "Сейчас применится".into() } else { "Есть неприменённые правки".into() })
+                } else {
+                    self.status.clone()
+                };
+                let color = match kind {
+                    StatusKind::Info => theme::MUTED,
+                    StatusKind::Busy => theme::ACCENT,
+                    StatusKind::Ok => theme::GREEN,
+                    StatusKind::Warn => theme::AMBER,
+                    StatusKind::Error => theme::RED,
+                };
+                theme::pill(ui, color, &text);
+            });
         });
     }
 
     // ---------------------------------------------------------------- side panel
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Мониторы");
+        theme::caption(ui, "Мониторы");
         for i in 0..self.displays.len() {
-            let d = &self.displays[i];
-            let text = format!(
-                "{}  {}{}",
-                d.number,
-                d.name,
-                if d.primary { "  · основной" } else { "" }
-            );
-            if ui.selectable_label(self.selected == Some(i), text).clicked() {
-                self.selected = Some(i);
-            }
+            self.monitor_row(ui, i);
         }
-        ui.separator();
+        ui.add_space(6.0);
 
         let Some(i) = self.selected.filter(|&i| i < self.displays.len()) else {
-            ui.label("Выберите монитор");
+            theme::card(ui, |ui| ui.label("Выберите монитор на схеме"));
             return;
         };
-        self.monitor_details(ui, i);
-        ui.separator();
-        self.edge_details(ui, i);
+        self.position_card(ui, i);
+        self.screen_card(ui, i);
+        self.edge_cards(ui, i);
     }
 
-    fn monitor_details(&mut self, ui: &mut egui::Ui, i: usize) {
-        let d = self.displays[i].clone();
-        ui.heading(format!("Монитор {}", d.number));
+    fn monitor_row(&mut self, ui: &mut egui::Ui, i: usize) {
+        let d = &self.displays[i];
+        let sel = self.selected == Some(i);
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 52.0), Sense::click());
+        let fill = if sel {
+            theme::ACCENT_DIM
+        } else if resp.hovered() {
+            theme::CARD_HI
+        } else {
+            theme::CARD
+        };
+        let p = ui.painter();
+        p.rect(rect, CornerRadius::same(10), fill, Stroke::new(1.0, if sel { theme::ACCENT } else { theme::STROKE }), StrokeKind::Inside);
+        let badge = egui::Rect::from_center_size(Pos2::new(rect.left() + 28.0, rect.center().y), Vec2::splat(32.0));
+        p.rect_filled(badge, CornerRadius::same(8), if sel { theme::ACCENT } else { theme::CARD_HI });
+        p.text(badge.center(), Align2::CENTER_CENTER, d.number.to_string(), FontId::new(16.0, egui::FontFamily::Name("strong".into())), Color32::WHITE);
+        p.text(Pos2::new(rect.left() + 54.0, rect.top() + 16.0), Align2::LEFT_CENTER, &d.name, FontId::new(14.0, egui::FontFamily::Name("strong".into())), theme::TEXT);
+        p.text(
+            Pos2::new(rect.left() + 54.0, rect.top() + 35.0),
+            Align2::LEFT_CENTER,
+            format!("{}×{} · {} Гц", d.width, d.height, d.refresh),
+            FontId::proportional(12.0),
+            theme::MUTED,
+        );
+        if d.primary {
+            p.text(Pos2::new(rect.right() - 12.0, rect.center().y), Align2::RIGHT_CENTER, "основной", FontId::proportional(12.0), theme::ACCENT);
+        }
+        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            self.selected = Some(i);
+        }
+    }
 
-        egui::Grid::new("details").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            ui.label("Режим");
-            ui.label(format!("{}×{} @ {} Гц", d.width, d.height, d.refresh));
-            ui.end_row();
-
-            ui.label("Масштаб Windows");
-            ui.label(format!("{:.0}%", d.dpi_scale * 100.0));
-            ui.end_row();
-
-            ui.label("Положение, пикс.");
+    fn position_card(&mut self, ui: &mut egui::Ui, i: usize) {
+        theme::card(ui, |ui| {
+            theme::caption(ui, &format!("Положение монитора {}", self.displays[i].number));
             ui.horizontal(|ui| {
                 let (mut x, mut y) = self.pos[i];
-                let cx = ui.add(egui::DragValue::new(&mut x).prefix("X ").speed(1)).changed();
-                let cy = ui.add(egui::DragValue::new(&mut y).prefix("Y ").speed(1)).changed();
-                if cx || cy {
+                let mut changed = false;
+                for (label, v) in [("X", &mut x), ("Y", &mut y)] {
+                    ui.label(RichText::new(label).color(theme::MUTED));
+                    changed |= ui.add_sized([96.0, 30.0], egui::DragValue::new(v).speed(1).suffix(" пикс.")).changed();
+                }
+                if changed {
                     self.pos[i] = (x, y);
                     self.mark_changed();
                 }
             });
-            ui.end_row();
 
-            let ((mut w, mut h), source) = self.sizes[i];
-            ui.label("Экран, мм");
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let cw = ui.add(egui::DragValue::new(&mut w).speed(0.1).range(50.0..=3000.0).max_decimals(1)).changed();
+                // Arrow pad.
+                let b = Vec2::splat(34.0);
+                egui::Grid::new("pad").spacing([4.0, 4.0]).show(ui, |ui| {
+                    ui.label("");
+                    if pad_button(ui, icon::UP, b).clicked() {
+                        self.nudge(i, 0, -1);
+                    }
+                    ui.label("");
+                    ui.end_row();
+                    if pad_button(ui, icon::LEFT, b).clicked() {
+                        self.nudge(i, -1, 0);
+                    }
+                    if pad_button(ui, icon::DOWN, b).clicked() {
+                        self.nudge(i, 0, 1);
+                    }
+                    if pad_button(ui, icon::RIGHT, b).clicked() {
+                        self.nudge(i, 1, 0);
+                    }
+                    ui.end_row();
+                });
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Шаг").size(12.0).color(theme::MUTED));
+                    theme::segmented(ui, &mut self.step, &[(Step::Px(1), "1"), (Step::Px(5), "5"), (Step::Px(10), "10"), (Step::Mm, "1 мм")]);
+                });
+            });
+            ui.label(RichText::new("Стрелки на клавиатуре, Shift — в 10 раз больше. Линейки на экранах можно тянуть мышью и крутить колесом.").size(12.0).color(theme::MUTED));
+        });
+        ui.add_space(4.0);
+    }
+
+    fn screen_card(&mut self, ui: &mut egui::Ui, i: usize) {
+        let d = self.displays[i].clone();
+        theme::card(ui, |ui| {
+            theme::caption(ui, "Экран");
+            let (mw, mh) = self.mm(i);
+            let diag = (mw * mw + mh * mh).sqrt() / 25.4;
+            let ppi = d.width as f32 / (mw / 25.4);
+            ui.horizontal(|ui| {
+                theme::stat(ui, "Диагональ", &format!("{diag:.1}″"));
+                theme::stat(ui, "Плотность", &format!("{ppi:.0} PPI"));
+                theme::stat(ui, "Масштаб", &format!("{:.0}%", d.dpi_scale * 100.0));
+            });
+
+            ui.add_space(4.0);
+            let ((mut w, mut h), source) = self.sizes[i];
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Видимая область").color(theme::MUTED));
+                let cw = ui.add_sized([70.0, 28.0], egui::DragValue::new(&mut w).speed(0.1).range(50.0..=3000.0).max_decimals(1)).changed();
                 ui.label("×");
-                let ch = ui.add(egui::DragValue::new(&mut h).speed(0.1).range(50.0..=3000.0).max_decimals(1)).changed();
+                let ch = ui.add_sized([70.0, 28.0], egui::DragValue::new(&mut h).speed(0.1).range(50.0..=3000.0).max_decimals(1)).changed();
+                ui.label(RichText::new("мм").color(theme::MUTED));
                 if cw || ch {
                     self.sizes[i] = ((w, h), SizeSource::User);
                     self.config.sizes.insert(d.key(), [w, h]);
@@ -418,115 +565,80 @@ impl App {
                     self.push_overlay();
                 }
             });
-            ui.end_row();
-
-            ui.label("");
             ui.horizontal(|ui| {
-                ui.weak(match source {
-                    SizeSource::Edid => "из EDID монитора",
-                    SizeSource::User => "введено вручную",
-                    SizeSource::Guess => "не определено, измерьте и введите",
-                });
-                if source == SizeSource::User && ui.small_button("сбросить").clicked() {
+                let (color, text) = match source {
+                    SizeSource::Edid => (theme::MUTED, "из EDID, может быть округлено"),
+                    SizeSource::User => (theme::GREEN, "измерено вручную"),
+                    SizeSource::Guess => (theme::AMBER, "монитор не сообщил размер, измерьте его"),
+                };
+                ui.label(RichText::new(text).size(12.0).color(color));
+                if source == SizeSource::User && ui.small_button("из EDID").clicked() {
                     self.config.sizes.remove(&d.key());
                     self.save_config();
                     self.sizes[i] = self.size_for(&d);
                     self.push_overlay();
                 }
             });
-            ui.end_row();
-
-            let (mw, mh) = self.mm(i);
-            let diag = ((mw * mw + mh * mh).sqrt()) / 25.4;
-            let ppi = d.width as f32 / (mw / 25.4);
-            ui.label("Диагональ, плотность");
-            ui.label(format!("{diag:.1}″, {ppi:.1} PPI ({:.3} мм/пикс.)", mw / d.width as f32));
-            ui.end_row();
         });
-        ui.label(egui::RichText::new(
-            "EDID часто округляет размер. Для точной подгонки измерьте видимую область экрана линейкой.",
-        ).small().weak());
-
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("Шаг:");
-            for (s, name) in [(Step::Px(1), "1 пикс."), (Step::Px(5), "5"), (Step::Px(10), "10"), (Step::Mm, "≈1 мм")] {
-                ui.selectable_value(&mut self.step, s, name);
-            }
-        });
-        let b = Vec2::splat(30.0);
-        egui::Grid::new("nudge").spacing([4.0, 4.0]).show(ui, |ui| {
-            ui.label("");
-            if ui.add_sized(b, egui::Button::new("↑")).clicked() {
-                self.nudge(i, 0, -1);
-            }
-            ui.label("");
-            ui.end_row();
-            if ui.add_sized(b, egui::Button::new("←")).clicked() {
-                self.nudge(i, -1, 0);
-            }
-            ui.label("");
-            if ui.add_sized(b, egui::Button::new("→")).clicked() {
-                self.nudge(i, 1, 0);
-            }
-            ui.end_row();
-            ui.label("");
-            if ui.add_sized(b, egui::Button::new("↓")).clicked() {
-                self.nudge(i, 0, 1);
-            }
-            ui.label("");
-            ui.end_row();
-        });
-        ui.weak("Стрелки на клавиатуре сдвигают на шаг, с Shift на 10 шагов.");
+        ui.add_space(4.0);
     }
 
-    fn edge_details(&mut self, ui: &mut egui::Ui, i: usize) {
-        ui.heading("Стыки");
+    fn edge_cards(&mut self, ui: &mut egui::Ui, i: usize) {
         let mons = self.edited_mons();
         let edges: Vec<Edge> = find_edges(&mons).into_iter().filter(|e| e.a == i || e.b == i).collect();
         if edges.is_empty() {
-            ui.colored_label(Color32::from_rgb(230, 160, 60), "Монитор не касается других. Windows сам придвинет его при применении.");
+            theme::card(ui, |ui| {
+                theme::caption(ui, "Стыки");
+                ui.label(RichText::new("Монитор не касается других. При применении он будет придвинут к ближайшему.").color(theme::AMBER));
+            });
             return;
         }
         for e in edges {
             let j = e.other(i);
             let me_b = e.b == i;
             let (side, start_word, low, high, presets) = match (e.axis, me_b) {
-                (Axis::Vertical, true) => ("слева", "Верх", "ниже", "выше", ["верх", "центр", "низ"]),
-                (Axis::Vertical, false) => ("справа", "Верх", "ниже", "выше", ["верх", "центр", "низ"]),
-                (Axis::Horizontal, true) => ("сверху", "Левый край", "правее", "левее", ["лево", "центр", "право"]),
-                (Axis::Horizontal, false) => ("снизу", "Левый край", "правее", "левее", ["лево", "центр", "право"]),
+                (Axis::Vertical, true) => ("слева", "Верх", "ниже", "выше", ["Верх", "Центр", "Низ"]),
+                (Axis::Vertical, false) => ("справа", "Верх", "ниже", "выше", ["Верх", "Центр", "Низ"]),
+                (Axis::Horizontal, true) => ("сверху", "Левый край", "правее", "левее", ["Лево", "Центр", "Право"]),
+                (Axis::Horizontal, false) => ("снизу", "Левый край", "правее", "левее", ["Лево", "Центр", "Право"]),
             };
             let other = self.displays[j].clone();
-            ui.group(|ui| {
-                ui.strong(format!("{side}: монитор {} {}", other.number, other.name));
+            let anchor = self.anchor;
+            theme::card(ui, |ui| {
+                theme::caption(ui, &format!("Стык с монитором {} · {side}", other.number));
 
-                let t0 = anchor_t(&e, self.anchor, None);
-                // Offset of my side's start relative to the neighbour's, in mm, positive = lower / further right.
+                let t0 = anchor_t(&e, anchor, None);
+                // Offset of this monitor's side relative to the neighbour's, positive = lower / further right.
                 let d_ab = implied_offset_mm(&e, &mons, t0);
                 let mine = if me_b { d_ab } else { -d_ab };
-                let px_off = if me_b { e.start(&mons[e.b]) - e.start(&mons[e.a]) } else { e.start(&mons[e.a]) - e.start(&mons[e.b]) };
-                ui.label(format!(
-                    "{start_word} этого экрана {} края соседа на {:.1} мм ({:+} пикс.)",
-                    if mine >= 0.0 { low } else { high },
-                    mine.abs(),
-                    px_off as i32
-                ));
+                let px_off = if me_b {
+                    e.start(&mons[e.b]) - e.start(&mons[e.a])
+                } else {
+                    e.start(&mons[e.a]) - e.start(&mons[e.b])
+                };
+                ui.horizontal(|ui| {
+                    ui.label(theme::strong(format!("{:.1} мм", mine.abs())).size(24.0));
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(RichText::new(format!("{start_word} {} края соседа", if mine >= 0.0 { low } else { high })).size(12.0).color(theme::MUTED));
+                        ui.label(RichText::new(format!("{:+} пикс.", px_off as i32)).size(12.0).color(theme::MUTED));
+                    });
+                });
                 let err = mismatch_mm(&e, &mons, t0, e.s0 as f64).abs().max(mismatch_mm(&e, &mons, t0, e.s1 as f64).abs());
                 if err >= 0.05 {
-                    ui.weak(format!(
-                        "Плотность пикселей разная: курсор идёт без скачка в точке «{}», на концах стыка расхождение до {err:.1} мм.",
-                        anchor_name(self.anchor).to_lowercase()
-                    ));
+                    ui.label(
+                        RichText::new(format!("Плотность пикселей разная: без скачка курсор проходит в точке «{}», к концам стыка расхождение до {err:.1} мм.", anchor_name(anchor).to_lowercase()))
+                            .size(12.0)
+                            .color(theme::AMBER),
+                    );
                 }
 
-                let anchor = self.anchor;
+                ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    ui.label("Выровнять по краю:");
+                    ui.label(RichText::new("Выровнять края").color(theme::MUTED));
                     let (la, lb) = (e.len_mm(&mons[e.a]), e.len_mm(&mons[e.b]));
-                    let d_values = [0.0, (la - lb) / 2.0, la - lb];
-                    for (name, d) in presets.iter().zip(d_values) {
-                        if ui.button(*name).on_hover_text("Считая, что края экранов стоят ровно, без смещения по высоте").clicked() {
+                    for (name, d) in presets.iter().zip([0.0, (la - lb) / 2.0, la - lb]) {
+                        if ui.button(*name).on_hover_text("Если сами экраны стоят ровно по этому краю").clicked() {
                             self.move_to(i, &e, &mons, d, anchor, me_b);
                         }
                     }
@@ -535,11 +647,13 @@ impl App {
                 let key = (self.displays[i].device_name.clone(), other.device_name.clone());
                 let mut measured = *self.measured.get(&key).unwrap_or(&0.0);
                 ui.horizontal(|ui| {
-                    ui.label(format!("Измерено: {start_word} этого экрана {low} на"));
-                    ui.add(egui::DragValue::new(&mut measured).speed(0.1).max_decimals(1).suffix(" мм"));
+                    ui.label(RichText::new(format!("Измерено: {low} на")).color(theme::MUTED));
+                    ui.add_sized([80.0, 28.0], egui::DragValue::new(&mut measured).speed(0.1).max_decimals(1).suffix(" мм"));
                     if ui
                         .button("Подогнать")
-                        .on_hover_text(format!("Положите линейку поперёк стыка и измерьте, насколько этот экран {low} соседа (отрицательное значение, если {high})."))
+                        .on_hover_text(format!(
+                            "Приложите линейку поперёк стыка и измерьте, насколько этот экран {low} соседа. Если {high}, введите минус."
+                        ))
                         .clicked()
                     {
                         let d = if me_b { measured as f64 } else { -measured as f64 };
@@ -548,6 +662,7 @@ impl App {
                 });
                 self.measured.insert(key, measured);
             });
+            ui.add_space(4.0);
         }
     }
 
@@ -562,19 +677,55 @@ impl App {
 
     // ---------------------------------------------------------------- canvas
 
-    fn fit(&mut self, area: egui::Rect) {
-        let mons = self.edited_mons();
+    fn canvas_toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 18.0;
+            if theme::toggle(ui, &mut self.rulers, "Линейки на экранах").changed() {
+                self.push_overlay();
+            }
+            if theme::toggle(ui, &mut self.live, "Применять сразу").changed() {
+                self.save_config();
+            }
+            if theme::toggle(ui, &mut self.topmost, "Поверх окон").changed() {
+                let level = if self.topmost { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if theme::ghost_button(ui, icon::FIT).on_hover_text("Показать всю раскладку").clicked() {
+                    self.fit_view = true;
+                }
+                if theme::segmented(
+                    ui,
+                    &mut self.anchor,
+                    &[(Anchor::Start, "Начало"), (Anchor::Center, "Центр"), (Anchor::End, "Конец"), (Anchor::Cursor, "Курсор")],
+                ) {
+                    self.save_config();
+                    self.push_overlay();
+                }
+                ui.label(RichText::new("Ноль линеек").color(theme::MUTED))
+                    .on_hover_text("Точка стыка, где курсор переходит без скачка. От неё отсчитываются миллиметры на линейках.");
+            });
+        });
+    }
+
+    fn bounds(&self, mons: &[Mon]) -> (i32, i32, i32, i32) {
         if mons.is_empty() {
-            return;
+            return (0, 0, 1, 1);
         }
         let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
-        for m in &mons {
+        for m in mons {
             x0 = x0.min(m.rect.x);
             y0 = y0.min(m.rect.y);
             x1 = x1.max(m.rect.right());
             y1 = y1.max(m.rect.bottom());
         }
-        let margin = 40.0;
+        (x0, y0, x1, y1)
+    }
+
+    fn fit(&mut self, area: egui::Rect) {
+        let (x0, y0, x1, y1) = self.bounds(&self.edited_mons());
+        let margin = 48.0;
         let bw = (x1 - x0).max(1) as f32;
         let bh = (y1 - y0).max(1) as f32;
         self.view_scale = ((area.width() - 2.0 * margin) / bw).min((area.height() - 2.0 * margin) / bh).max(0.001);
@@ -587,10 +738,7 @@ impl App {
     }
 
     fn screen_rect(&self, r: &Rect) -> egui::Rect {
-        egui::Rect::from_min_max(
-            self.to_screen(r.x as f32, r.y as f32),
-            self.to_screen(r.right() as f32, r.bottom() as f32),
-        )
+        egui::Rect::from_min_max(self.to_screen(r.x as f32, r.y as f32), self.to_screen(r.right() as f32, r.bottom() as f32))
     }
 
     fn hit(&self, p: Pos2) -> Option<usize> {
@@ -657,20 +805,22 @@ impl App {
             }
         }
         if let Some(d) = &self.drag {
-            if let Some(p) = resp.interact_pointer_pos() {
-                let delta = (p - d.start_mouse) / self.view_scale;
-                let x = d.start_pos.0 as f64 + delta.x as f64;
-                let y = d.start_pos.1 as f64 + delta.y as f64;
-                let i = d.index;
-                let no_snap = ui.input(|inp| inp.modifiers.alt);
-                let new = if no_snap { (x.round() as i32, y.round() as i32) } else { self.snap(i, x, y) };
-                if new != self.pos[i] {
-                    self.pos[i] = new;
-                    self.mark_changed();
+            let i = d.index;
+            if resp.dragged_by(PointerButton::Primary) {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let delta = (p - d.start_mouse) / self.view_scale;
+                    let x = d.start_pos.0 as f64 + delta.x as f64;
+                    let y = d.start_pos.1 as f64 + delta.y as f64;
+                    let no_snap = ui.input(|inp| inp.modifiers.alt);
+                    let new = if no_snap { (x.round() as i32, y.round() as i32) } else { self.snap(i, x, y) };
+                    if new != self.pos[i] {
+                        self.pos[i] = new;
+                        self.mark_changed();
+                    }
                 }
-            }
-            if !resp.dragged_by(PointerButton::Primary) {
+            } else {
                 self.drag = None;
+                self.attach(i);
             }
         }
         if resp.clicked() {
@@ -682,21 +832,20 @@ impl App {
         }
 
         let painter = painter.with_clip_rect(area);
-        painter.rect_filled(area, CornerRadius::ZERO, ui.visuals().extreme_bg_color);
+        painter.rect(area, CornerRadius::same(14), theme::BG, Stroke::new(1.0, theme::STROKE), StrokeKind::Inside);
+        self.draw_grid(&painter, area);
 
         let mons = self.edited_mons();
         let applied = self.applied_mons();
-        let accent = Color32::from_rgb(60, 160, 255);
+        let strong = egui::FontFamily::Name("strong".into());
 
         // Where monitors are right now in Windows, if they've been moved since.
         for (i, m) in applied.iter().enumerate() {
             if m.rect != mons[i].rect {
-                painter.rect_stroke(
-                    self.screen_rect(&m.rect),
-                    CornerRadius::ZERO,
-                    Stroke::new(1.0, Color32::from_gray(110)),
-                    StrokeKind::Inside,
-                );
+                let r = self.screen_rect(&m.rect);
+                let s = Stroke::new(1.0, theme::MUTED);
+                let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+                painter.extend(Shape::dashed_line(&pts, s, 6.0, 5.0));
             }
         }
 
@@ -705,76 +854,119 @@ impl App {
             let r = self.screen_rect(&m.rect);
             let sel = self.selected == Some(i);
             let overlaps = mons.iter().enumerate().any(|(j, o)| j != i && o.rect.intersects(&m.rect));
-            let fill = if sel { Color32::from_rgb(38, 62, 98) } else { Color32::from_rgb(48, 52, 60) };
-            painter.rect_filled(r, CornerRadius::same(2), fill);
-            let border = if overlaps {
-                Color32::from_rgb(230, 80, 80)
-            } else if sel {
-                accent
-            } else {
-                Color32::from_gray(140)
-            };
-            painter.rect_stroke(r, CornerRadius::same(2), Stroke::new(if sel { 2.0 } else { 1.0 }, border), StrokeKind::Inside);
 
-            let big = (r.height() * 0.28).clamp(10.0, 64.0);
-            painter.text(r.center() - Vec2::new(0.0, big * 0.35), Align2::CENTER_CENTER, d.number.to_string(), FontId::proportional(big), Color32::WHITE);
-            if r.width() > 120.0 && r.height() > 70.0 {
+            painter.rect_filled(r.translate(Vec2::new(0.0, 4.0)).expand(2.0), CornerRadius::same(8), Color32::from_black_alpha(90));
+            let fill = if sel { Color32::from_rgb(30, 44, 78) } else { theme::CARD_HI };
+            painter.rect_filled(r, CornerRadius::same(6), fill);
+            // A thin "bezel" at the top, like a real screen.
+            let bezel = egui::Rect::from_min_max(r.left_top(), Pos2::new(r.right(), r.top() + 3.0));
+            painter.rect_filled(bezel, CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, if sel { theme::ACCENT } else { theme::STROKE });
+            let border = if overlaps {
+                theme::RED
+            } else if sel {
+                theme::ACCENT
+            } else {
+                theme::STROKE
+            };
+            painter.rect_stroke(r, CornerRadius::same(6), Stroke::new(if sel { 2.0 } else { 1.0 }, border), StrokeKind::Inside);
+            if sel {
+                painter.rect_stroke(r.expand(4.0), CornerRadius::same(9), Stroke::new(3.0, theme::ACCENT.gamma_multiply(0.18)), StrokeKind::Outside);
+            }
+
+            let big = (r.height() * 0.3).clamp(12.0, 72.0);
+            painter.text(
+                r.center() - Vec2::new(0.0, big * 0.3),
+                Align2::CENTER_CENTER,
+                d.number.to_string(),
+                FontId::new(big, strong.clone()),
+                if sel { Color32::WHITE } else { theme::TEXT.gamma_multiply(0.85) },
+            );
+            if r.width() > 130.0 && r.height() > 80.0 {
                 let (mw, mh) = self.mm(i);
-                let info = format!("{}\n{}×{} · {:.0}×{:.0} мм\n({}, {})", d.name, d.width, d.height, mw, mh, m.rect.x, m.rect.y);
-                painter.text(r.center() + Vec2::new(0.0, big * 0.45), Align2::CENTER_TOP, info, FontId::proportional(12.0), Color32::from_gray(200));
+                painter.text(r.center() + Vec2::new(0.0, big * 0.42), Align2::CENTER_TOP, &d.name, FontId::new(13.0, strong.clone()), theme::TEXT);
+                painter.text(
+                    r.center() + Vec2::new(0.0, big * 0.42 + 18.0),
+                    Align2::CENTER_TOP,
+                    format!("{}×{} · {:.0}×{:.0} мм · ({}, {})", d.width, d.height, mw, mh, m.rect.x, m.rect.y),
+                    FontId::proportional(12.0),
+                    theme::MUTED,
+                );
             }
         }
 
-        // Shared edges with their pixel offset.
+        // Shared edges with their offset.
         for e in find_edges(&mons) {
             let (a, b) = match e.axis {
                 Axis::Vertical => (self.to_screen(e.pos as f32, e.s0 as f32), self.to_screen(e.pos as f32, e.s1 as f32)),
                 Axis::Horizontal => (self.to_screen(e.s0 as f32, e.pos as f32), self.to_screen(e.s1 as f32, e.pos as f32)),
             };
-            painter.line_segment([a, b], Stroke::new(3.0, Color32::from_rgb(70, 210, 120)));
+            painter.line_segment([a, b], Stroke::new(3.0, theme::GREEN));
             let off = e.start(&mons[e.b]) - e.start(&mons[e.a]);
+            let mm = implied_offset_mm(&e, &mons, anchor_t(&e, self.anchor, None));
             let mid = a + (b - a) / 2.0;
-            let t0 = anchor_t(&e, self.anchor, None);
-            let mm = implied_offset_mm(&e, &mons, t0);
-            painter.text(
-                mid,
-                Align2::CENTER_CENTER,
-                format!("{:+} пикс. / {:+.1} мм", off as i32, mm),
-                FontId::proportional(12.0),
-                Color32::from_rgb(140, 240, 170),
-            );
+            let text = format!("{:+} пикс. · {:+.1} мм", off as i32, mm);
+            let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), theme::GREEN);
+            let pill = egui::Rect::from_center_size(mid, galley.size() + Vec2::new(16.0, 8.0));
+            painter.rect(pill, CornerRadius::same(10), Color32::from_rgb(16, 40, 31), Stroke::new(1.0, theme::GREEN.gamma_multiply(0.5)), StrokeKind::Inside);
+            painter.galley(pill.center() - galley.size() / 2.0, galley, theme::GREEN);
         }
 
         painter.text(
-            area.left_bottom() + Vec2::new(8.0, -8.0),
+            area.left_bottom() + Vec2::new(14.0, -12.0),
             Align2::LEFT_BOTTOM,
-            "Перетаскивайте мониторы мышью (Alt без прилипания) · колесо масштаб · правая кнопка двигает вид",
+            "Перетаскивайте мониторы мышью · Alt — без прилипания · колесо — масштаб · правая кнопка — сдвиг вида",
             FontId::proportional(12.0),
-            Color32::from_gray(130),
+            theme::MUTED,
         );
+    }
+
+    fn draw_grid(&self, painter: &egui::Painter, area: egui::Rect) {
+        // Dots every 100, 500 or 1000 desktop pixels, whichever is at least ~24 points apart.
+        let step = [100.0, 500.0, 1000.0, 5000.0].into_iter().find(|s| s * self.view_scale >= 24.0).unwrap_or(10000.0);
+        let to_desk = |p: Pos2| (p - self.view_offset.to_pos2()) / self.view_scale;
+        let (a, b) = (to_desk(area.left_top()), to_desk(area.right_bottom()));
+        let color = Color32::from_rgb(34, 39, 52);
+        let mut x = (a.x / step).floor() * step;
+        while x <= b.x {
+            let mut y = (a.y / step).floor() * step;
+            while y <= b.y {
+                painter.circle_filled(self.to_screen(x, y), 1.2, color);
+                y += step;
+            }
+            x += step;
+        }
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.handle_keys(&ctx);
+        self.poll_apply();
+        self.handle_input(&ctx);
         self.live_tick(&ctx);
 
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.add_space(4.0);
-            self.toolbar(ui);
-            ui.add_space(2.0);
-        });
-        egui::Panel::bottom("status").show(ui, |ui| {
-            let pending = if self.has_changes() { "  · есть неприменённые изменения" } else { "" };
-            ui.label(format!("{}{pending}", self.status));
-        });
-        egui::Panel::right("side").resizable(true).default_size(380.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui));
-        });
-        egui::CentralPanel::default().show(ui, |ui| self.canvas(ui));
+        egui::Panel::top("header")
+            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(16, 12)).stroke(Stroke::new(1.0, theme::STROKE)))
+            .show(ui, |ui| self.header(ui));
+        egui::Panel::right("side")
+            .resizable(false)
+            .exact_size(392.0)
+            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(Margin::same(14)))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.side_panel(ui));
+            });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(Margin { left: 14, right: 0, top: 12, bottom: 14 }))
+            .show(ui, |ui| {
+                self.canvas_toolbar(ui);
+                ui.add_space(6.0);
+                self.canvas(ui);
+            });
     }
+}
+
+fn pad_button(ui: &mut egui::Ui, glyph: &str, size: Vec2) -> egui::Response {
+    ui.add_sized(size, egui::Button::new(RichText::new(glyph).size(13.0)).corner_radius(CornerRadius::same(8)))
 }
 
 fn anchor_name(a: Anchor) -> &'static str {
@@ -786,19 +978,10 @@ fn anchor_name(a: Anchor) -> &'static str {
     }
 }
 
-/// Uses Segoe UI from Windows, falling back to egui's bundled fonts.
-fn setup_fonts(ctx: &egui::Context) {
-    let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") else { return };
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert("segoe".into(), egui::FontData::from_owned(bytes).into());
-    if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-        list.insert(0, "segoe".into());
+fn monitors_word(n: usize) -> &'static str {
+    match (n % 10, n % 100) {
+        (1, r) if r != 11 => "монитор",
+        (2..=4, r) if !(12..=14).contains(&r) => "монитора",
+        _ => "мониторов",
     }
-    if let Ok(sym) = std::fs::read(r"C:\Windows\Fonts\seguisym.ttf") {
-        fonts.font_data.insert("segoe-symbol".into(), egui::FontData::from_owned(sym).into());
-        if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-            list.insert(1, "segoe-symbol".into());
-        }
-    }
-    ctx.set_fonts(fonts);
 }
