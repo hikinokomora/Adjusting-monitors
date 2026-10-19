@@ -93,10 +93,10 @@ pub struct App {
     anchor_bar: Vec2,
     zoom_bar: Vec2,
     drag: Option<Drag>,
-    /// Until when to keep checking the window after the desktop layout changed.
-    settle_until: Option<Instant>,
-    /// Step of the forced resize that makes the renderer catch up with the real window size.
-    resync: Option<(Vec2, bool)>,
+    /// When to shake the window size after the desktop layout changed (see `fix_window`).
+    window_fix_at: Vec<Instant>,
+    /// Window size to restore after growing it by a pixel.
+    window_restore: Option<(Instant, i32, i32)>,
 }
 
 impl App {
@@ -131,8 +131,8 @@ impl App {
             anchor_bar: Vec2::new(400.0, 46.0),
             zoom_bar: Vec2::new(170.0, 46.0),
             drag: None,
-            settle_until: None,
-            resync: None,
+            window_fix_at: Vec::new(),
+            window_restore: None,
         };
         app.reload();
         app.initial = app.displays.iter().map(|d| (d.device_name.clone(), d.x, d.y)).collect();
@@ -252,7 +252,7 @@ impl App {
         let Some(job) = &self.applying else { return };
         let Ok(result) = job.rx.try_recv() else { return };
         let job = self.applying.take().unwrap();
-        self.settle_until = Some(Instant::now() + Duration::from_millis(1500));
+        self.schedule_window_fix();
         let (sx, sy) = job.shift;
         let edits = self.pos.clone();
         let fresh = display::enumerate();
@@ -330,6 +330,18 @@ impl App {
                     self.pos[mon].1 += dy;
                     self.selected = Some(mon);
                     self.mark_changed();
+                }
+                OverlayEvent::DisplayChanged => {
+                    self.schedule_window_fix();
+                    // Somebody else changed the layout: show it, unless we are in the middle of editing.
+                    if self.applying.is_none() && !self.has_changes() && self.drag.is_none() {
+                        let before: Vec<(i32, i32)> = self.displays.iter().map(|d| (d.x, d.y)).collect();
+                        self.reload();
+                        let after: Vec<(i32, i32)> = self.displays.iter().map(|d| (d.x, d.y)).collect();
+                        if before != after {
+                            self.fit_view = true;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1047,45 +1059,75 @@ impl eframe::App for App {
 }
 
 impl App {
-    /// After Windows rearranges the desktop it can move and resize this window without the
-    /// renderer noticing: the picture then sits off-centre, edges flicker and the pointer misses
-    /// buttons. Compare the real client size with what egui draws and force a resize if they differ.
+    fn schedule_window_fix(&mut self) {
+        let now = Instant::now();
+        // Windows keeps rearranging windows for a moment after the change, so do it twice.
+        self.window_fix_at = vec![now + Duration::from_millis(300), now + Duration::from_millis(1200)];
+        self.ctx.request_repaint_after(Duration::from_millis(300));
+    }
+
+    /// After Windows rearranges the desktop, the picture of this window can stay shifted
+    /// relative to its frame: the top is cut off, white strips appear at the right and bottom and
+    /// the pointer misses buttons. A real resize makes the renderer rebuild its surface, so grow
+    /// the window by a pixel, let one frame render, and put the size back.
     fn keep_window_in_sync(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        if let Some((size, grown)) = self.resync.take() {
-            if grown {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        let now = Instant::now();
+        let Some(hwnd) = window_handle(frame) else { return };
+        if let Some((at, w, h)) = self.window_restore {
+            if now >= at {
+                self.window_restore = None;
+                set_window_size(hwnd, w, h);
                 ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(at - now);
             }
             return;
         }
-        let Some(until) = self.settle_until else { return };
-        if Instant::now() > until {
-            self.settle_until = None;
+        let Some(&due) = self.window_fix_at.first() else { return };
+        if now < due {
+            ctx.request_repaint_after(due - now);
             return;
         }
-        ctx.request_repaint_after(Duration::from_millis(50));
-
-        let Some((cw, ch)) = client_size(frame) else { return };
-        let ppp = ctx.pixels_per_point();
-        let drawn = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size() * ppp);
-        let Some(drawn) = drawn else { return };
-        if (drawn.x - cw as f32).abs() > 1.0 || (drawn.y - ch as f32).abs() > 1.0 {
-            // Same size would be a no-op for Windows, so grow by a pixel and come back next frame.
-            let real = Vec2::new(cw as f32, ch as f32) / ppp;
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(real + Vec2::new(1.0, 0.0)));
-            self.resync = Some((real, true));
-            ctx.request_repaint();
+        self.window_fix_at.remove(0);
+        if let Some((w, h)) = shake_window(hwnd) {
+            self.window_restore = Some((now + Duration::from_millis(120), w, h));
+            ctx.request_repaint_after(Duration::from_millis(120));
         }
     }
 }
 
-fn client_size(frame: &eframe::Frame) -> Option<(i32, i32)> {
+fn window_handle(frame: &eframe::Frame) -> Option<windows_sys::Win32::Foundation::HWND> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let handle = frame.window_handle().ok()?;
     let RawWindowHandle::Win32(h) = handle.as_raw() else { return None };
-    let mut r: windows_sys::Win32::Foundation::RECT = unsafe { std::mem::zeroed() };
-    let ok = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(h.hwnd.get() as _, &mut r) };
-    (ok != 0).then_some((r.right - r.left, r.bottom - r.top))
+    Some(h.hwnd.get() as _)
+}
+
+/// Grows the window by one pixel and returns the size to restore, or re-maximizes it.
+fn shake_window(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<(i32, i32)> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsZoomed, SW_MAXIMIZE, SW_RESTORE, ShowWindow};
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            return None;
+        }
+        if IsZoomed(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+            ShowWindow(hwnd, SW_MAXIMIZE);
+            return None;
+        }
+        let mut r: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut r) == 0 {
+            return None;
+        }
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        set_window_size(hwnd, w + 1, h);
+        Some((w, h))
+    }
+}
+
+fn set_window_size(hwnd: windows_sys::Win32::Foundation::HWND, w: i32, h: i32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos};
+    unsafe { SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) };
 }
 
 fn pad_button(ui: &mut egui::Ui, glyph: &str, size: Vec2) -> egui::Response {

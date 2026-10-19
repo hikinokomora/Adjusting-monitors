@@ -26,7 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     HWND_TOPMOST, IDC_SIZENS, IDC_SIZEWE, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE, MSG,
     PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassExW, SW_SHOWNOACTIVATE,
     SWP_NOACTIVATE, SetCursor, SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow,
-    TranslateMessage, WM_APP, WM_CAPTURECHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    TranslateMessage, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_QUIT, WM_SETCURSOR, WM_TIMER,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -53,6 +53,8 @@ pub struct OverlayData {
 pub enum OverlayEvent {
     /// Move a monitor by this many desktop pixels.
     Shift { mon: usize, dx: i32, dy: i32 },
+    /// Windows reported a change of the desktop layout or resolution.
+    DisplayChanged,
 }
 
 const WM_APP_REBUILD: u32 = WM_APP + 1;
@@ -212,6 +214,10 @@ unsafe fn run(
         wc.hInstance = hinst;
         wc.lpszClassName = class.as_ptr();
         RegisterClassExW(&wc);
+
+        // An invisible top-level window, so display change broadcasts arrive even with the rulers off.
+        let title = wide("Display watcher");
+        CreateWindowExW(WS_EX_TOOLWINDOW, class.as_ptr(), title.as_ptr(), WS_POPUP, 0, 0, 0, 0, null_mut(), null_mut(), hinst, null());
 
         SetTimer(null_mut(), 0, 30, None);
 
@@ -389,6 +395,19 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             }
             WM_ERASEBKGND => 1,
             WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+            WM_DISPLAYCHANGE => {
+                // Every ruler gets the broadcast too; one notice is enough.
+                let watcher = STATE.with(|s| !s.borrow().strips.iter().any(|st| st.hwnd == h));
+                if watcher {
+                    STATE.with(|s| {
+                        if let Some((tx, ctx)) = &s.borrow().events {
+                            let _ = tx.send(OverlayEvent::DisplayChanged);
+                            ctx.request_repaint();
+                        }
+                    });
+                }
+                DefWindowProcW(h, msg, wp, lp)
+            }
             WM_SETCURSOR => {
                 let vertical = STATE.with(|s| {
                     let s = s.borrow();
