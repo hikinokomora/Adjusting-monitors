@@ -6,6 +6,7 @@ mod display;
 mod edid;
 mod layout;
 mod overlay;
+mod theme;
 
 use eframe::egui;
 use windows_sys::Win32::UI::HiDpi::{
