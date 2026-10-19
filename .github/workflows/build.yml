@@ -47,6 +47,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          name: Выравнивание мониторов ${{ github.ref_name }}
+          name: Monitor Aligner ${{ github.ref_name }}
           body_path: release-notes.md
           files: MonitorAligner.exe
