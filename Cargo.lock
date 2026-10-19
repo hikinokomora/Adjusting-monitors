@@ -1820,6 +1820,7 @@ name = "monitor-aligner"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "windows-sys 0.61.2",

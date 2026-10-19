@@ -93,6 +93,10 @@ pub struct App {
     anchor_bar: Vec2,
     zoom_bar: Vec2,
     drag: Option<Drag>,
+    /// Until when to keep checking the window after the desktop layout changed.
+    settle_until: Option<Instant>,
+    /// Step of the forced resize that makes the renderer catch up with the real window size.
+    resync: Option<(Vec2, bool)>,
 }
 
 impl App {
@@ -127,6 +131,8 @@ impl App {
             anchor_bar: Vec2::new(400.0, 46.0),
             zoom_bar: Vec2::new(170.0, 46.0),
             drag: None,
+            settle_until: None,
+            resync: None,
         };
         app.reload();
         app.initial = app.displays.iter().map(|d| (d.device_name.clone(), d.x, d.y)).collect();
@@ -246,6 +252,7 @@ impl App {
         let Some(job) = &self.applying else { return };
         let Ok(result) = job.rx.try_recv() else { return };
         let job = self.applying.take().unwrap();
+        self.settle_until = Some(Instant::now() + Duration::from_millis(1500));
         let (sx, sy) = job.shift;
         let edits = self.pos.clone();
         let fresh = display::enumerate();
@@ -1013,9 +1020,10 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_apply();
+        self.keep_window_in_sync(&ctx, frame);
         self.handle_input(&ctx);
         self.live_tick(&ctx);
 
@@ -1036,6 +1044,48 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(Margin { left: 14, right: 12, top: 14, bottom: 14 }))
             .show(ui, |ui| self.canvas(ui));
     }
+}
+
+impl App {
+    /// After Windows rearranges the desktop it can move and resize this window without the
+    /// renderer noticing: the picture then sits off-centre, edges flicker and the pointer misses
+    /// buttons. Compare the real client size with what egui draws and force a resize if they differ.
+    fn keep_window_in_sync(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if let Some((size, grown)) = self.resync.take() {
+            if grown {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                ctx.request_repaint();
+            }
+            return;
+        }
+        let Some(until) = self.settle_until else { return };
+        if Instant::now() > until {
+            self.settle_until = None;
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(50));
+
+        let Some((cw, ch)) = client_size(frame) else { return };
+        let ppp = ctx.pixels_per_point();
+        let drawn = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size() * ppp);
+        let Some(drawn) = drawn else { return };
+        if (drawn.x - cw as f32).abs() > 1.0 || (drawn.y - ch as f32).abs() > 1.0 {
+            // Same size would be a no-op for Windows, so grow by a pixel and come back next frame.
+            let real = Vec2::new(cw as f32, ch as f32) / ppp;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(real + Vec2::new(1.0, 0.0)));
+            self.resync = Some((real, true));
+            ctx.request_repaint();
+        }
+    }
+}
+
+fn client_size(frame: &eframe::Frame) -> Option<(i32, i32)> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = frame.window_handle().ok()?;
+    let RawWindowHandle::Win32(h) = handle.as_raw() else { return None };
+    let mut r: windows_sys::Win32::Foundation::RECT = unsafe { std::mem::zeroed() };
+    let ok = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(h.hwnd.get() as _, &mut r) };
+    (ok != 0).then_some((r.right - r.left, r.bottom - r.top))
 }
 
 fn pad_button(ui: &mut egui::Ui, glyph: &str, size: Vec2) -> egui::Response {
