@@ -3,6 +3,13 @@
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 
+use windows_sys::Win32::Devices::Display::{
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO,
+    DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+    SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    SetDisplayConfig,
+};
 use windows_sys::Win32::Foundation::{LPARAM, POINTL, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     CDS_NORESET, CDS_UPDATEREGISTRY, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_BADDUALVIEW,
@@ -187,6 +194,75 @@ fn monitor_scales() -> Vec<(String, f32)> {
 /// Moves displays to the given desktop positions in one go.
 /// The primary display must be at (0, 0).
 pub fn apply_positions(items: &[(String, i32, i32)]) -> Result<(), String> {
+    // SetDisplayConfig changes only the source positions, without a mode set,
+    // so the screens don't blank. The older API is a fallback for odd drivers.
+    match apply_with_display_config(items) {
+        Ok(()) => Ok(()),
+        Err(_) => apply_with_change_settings(items),
+    }
+}
+
+fn apply_with_display_config(items: &[(String, i32, i32)]) -> Result<(), String> {
+    unsafe {
+        let (mut np, mut nm) = (0u32, 0u32);
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) != 0 {
+            return Err("GetDisplayConfigBufferSizes".into());
+        }
+        let mut paths: Vec<DISPLAYCONFIG_PATH_INFO> = vec![zeroed(); np as usize];
+        let mut modes: Vec<DISPLAYCONFIG_MODE_INFO> = vec![zeroed(); nm as usize];
+        if QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut np,
+            paths.as_mut_ptr(),
+            &mut nm,
+            modes.as_mut_ptr(),
+            null_mut(),
+        ) != 0
+        {
+            return Err("QueryDisplayConfig".into());
+        }
+        paths.truncate(np as usize);
+        modes.truncate(nm as usize);
+
+        let mut moved = 0;
+        for path in &paths {
+            let mut name: DISPLAYCONFIG_SOURCE_DEVICE_NAME = zeroed();
+            name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            name.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+            name.header.adapterId = path.sourceInfo.adapterId;
+            name.header.id = path.sourceInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut name.header) != 0 {
+                continue;
+            }
+            let gdi = wstr(&name.viewGdiDeviceName);
+            let Some((_, x, y)) = items.iter().find(|(n, _, _)| *n == gdi) else { continue };
+            let idx = path.sourceInfo.Anonymous.modeInfoIdx as usize;
+            let Some(mode) = modes.get_mut(idx) else { continue };
+            if mode.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+                continue;
+            }
+            mode.Anonymous.sourceMode.position = POINTL { x: *x, y: *y };
+            moved += 1;
+        }
+        if moved == 0 {
+            return Err("no matching display paths".into());
+        }
+
+        let r = SetDisplayConfig(
+            np,
+            paths.as_ptr(),
+            nm,
+            modes.as_ptr(),
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE,
+        );
+        if r != 0 {
+            return Err(format!("SetDisplayConfig: {r}"));
+        }
+    }
+    Ok(())
+}
+
+fn apply_with_change_settings(items: &[(String, i32, i32)]) -> Result<(), String> {
     unsafe {
         for (name, x, y) in items {
             let w = wide(name);

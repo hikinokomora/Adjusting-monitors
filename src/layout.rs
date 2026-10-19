@@ -173,6 +173,39 @@ pub fn target_start(e: &Edge, mons: &[Mon], d: f64, anchor: Anchor, move_b: bool
     v.round() as i32
 }
 
+fn touches(a: &Rect, b: &Rect) -> bool {
+    let y_overlap = a.y.max(b.y) < a.bottom().min(b.bottom());
+    let x_overlap = a.x.max(b.x) < a.right().min(b.right());
+    ((a.right() == b.x || b.right() == a.x) && y_overlap)
+        || ((a.bottom() == b.y || b.bottom() == a.y) && x_overlap)
+}
+
+/// Nearest position for `me` that touches at least one of `others` along an edge and overlaps
+/// none of them. Windows rearranges such layouts by itself, so it's better to do it predictably.
+pub fn attach(me: Rect, others: &[Rect]) -> (i32, i32) {
+    let ok = |r: &Rect| !others.iter().any(|o| r.intersects(o)) && others.iter().any(|o| touches(r, o));
+    if others.is_empty() || ok(&me) {
+        return (me.x, me.y);
+    }
+    let (x, y, w, h) = (me.x, me.y, me.w, me.h);
+    let mut best: Option<(i64, (i32, i32))> = None;
+    for o in others {
+        let ys = y.clamp(o.y - h + 1, o.bottom() - 1);
+        let xs = x.clamp(o.x - w + 1, o.right() - 1);
+        for (cx, cy) in [(o.right(), ys), (o.x - w, ys), (xs, o.bottom()), (xs, o.y - h)] {
+            let r = Rect { x: cx, y: cy, w, h };
+            if !ok(&r) {
+                continue;
+            }
+            let d = (cx - x) as i64 * (cx - x) as i64 + (cy - y) as i64 * (cy - y) as i64;
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, (cx, cy)));
+            }
+        }
+    }
+    best.map(|(_, p)| p).unwrap_or((x, y))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +230,15 @@ mod tests {
         let d = implied_offset_mm(&e, &mons, 500.0);
         assert!((d - 100.0 / (1080.0 / 299.0)).abs() < 1e-9);
         assert_eq!(mismatch_mm(&e, &mons, 500.0, 1000.0), 0.0);
+    }
+
+    #[test]
+    fn attach_pulls_detached_monitor_back() {
+        let a = Rect { x: 0, y: 0, w: 1920, h: 1080 };
+        assert_eq!(attach(Rect { x: 1950, y: 100, w: 1920, h: 1080 }, &[a]), (1920, 100));
+        assert_eq!(attach(Rect { x: 1920, y: 1200, w: 1920, h: 1080 }, &[a]), (1919, 1080));
+        assert_eq!(attach(Rect { x: 1900, y: 0, w: 1920, h: 1080 }, &[a]), (1920, 0));
+        assert_eq!(attach(Rect { x: 1920, y: 5, w: 1920, h: 1080 }, &[a]), (1920, 5));
     }
 
     #[test]
